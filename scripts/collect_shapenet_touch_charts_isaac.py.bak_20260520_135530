@@ -1,0 +1,2779 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Collect TouchSDF-style touch charts from ShapeNet meshes using Isaac rendering.
+
+This script mirrors the data contract of TouchSDF's ``extract_touch_charts.py``:
+each sample contains a tactile image and a GT local surface patch point cloud.
+The tactile image is rendered by an Isaac Lab camera looking at a sampled mesh
+surface contact, while the GT patch is computed directly from the ShapeNet mesh.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import pickle
+import shutil
+import time
+from datetime import datetime
+from pathlib import Path
+
+from isaaclab.app import AppLauncher
+
+
+parser = argparse.ArgumentParser(description="Collect Isaac-rendered TouchSDF touch charts from ShapeNet meshes.")
+parser.add_argument("--shapenet_root", type=str, required=True, help="Root containing ShapeNetCore categories.")
+parser.add_argument("--touchsdf_root", type=str, default="", help="TouchSDF root. If set, output defaults to results/.")
+parser.add_argument("--output_root", type=str, default="", help="Output root. Overrides --touchsdf_root/results.")
+parser.add_argument("--name_output", type=str, default="", help="Dataset suffix or full touch_charts_gt_* name.")
+parser.add_argument("--category_ids", type=str, default="", help="Comma-separated category folder names to include.")
+parser.add_argument("--object_ids", type=str, default="", help="Comma-separated object folder names to include.")
+parser.add_argument("--start_object_index", type=int, default=0, help="First object index after filtering.")
+parser.add_argument("--max_objects", type=int, default=0, help="Maximum objects to process. 0 means all.")
+parser.add_argument("--charts_per_object", type=int, default=8, help="Touches to attempt per object.")
+parser.add_argument("--total_target_charts", type=int, default=320, help="Stop after this many valid charts.")
+parser.add_argument("--points_per_touch", type=int, default=200, help="GT patch points per touch.")
+parser.add_argument("--tactile_img_size", type=int, default=256, help="Rendered tactile image size.")
+parser.add_argument("--scale", type=float, default=0.30, help="Scale applied to normalized ShapeNet meshes.")
+parser.add_argument("--object_world_x", type=float, default=0.50, help="World-space x translation applied to the sampled ShapeNet object.")
+parser.add_argument("--object_world_y", type=float, default=0.0, help="World-space y translation applied to the sampled ShapeNet object.")
+parser.add_argument("--object_world_z", type=float, default=0.0, help="World-space z translation applied to the sampled ShapeNet object.")
+parser.add_argument(
+    "--object_bottom_z",
+    type=float,
+    default=None,
+    help=(
+        "If set, place the scaled object's lowest mesh point at object_world_z + object_bottom_z. "
+        "This avoids centering half of the ShapeNet object below z=0."
+    ),
+)
+parser.add_argument("--patch_radius", type=float, default=0.045, help="Surface patch radius in meters.")
+parser.add_argument("--dense_surface_samples", type=int, default=50000, help="Dense mesh samples for GT patch lookup.")
+parser.add_argument(
+    "--contact_sampling_strategy",
+    choices=["stratified_hemisphere", "top_farthest"],
+    default="stratified_hemisphere",
+    help="How to choose candidate contacts. Stratified hemisphere spreads TacTip approach angles over azimuth/elevation bins.",
+)
+parser.add_argument("--contact_azimuth_bins", type=int, default=8, help="Azimuth bins for stratified hemisphere contact sampling.")
+parser.add_argument("--contact_elevation_bins", type=int, default=4, help="Elevation bins for stratified hemisphere contact sampling.")
+parser.add_argument("--contact_min_elevation_deg", type=float, default=5.0, help="Minimum upper-hemisphere elevation angle for contact candidates.")
+parser.add_argument("--contact_max_elevation_deg", type=float, default=88.0, help="Maximum upper-hemisphere elevation angle for contact candidates.")
+parser.add_argument("--contact_oversample_factor", type=int, default=48, help="Surface candidates sampled per requested contact before stratification.")
+parser.add_argument(
+    "--tactile_mode",
+    choices=["tactip_deformation", "legacy_depth_proxy"],
+    default="tactip_deformation",
+    help="TacTip reference-depth difference or the older object-depth proxy.",
+)
+parser.add_argument("--sensor_type", type=str, default="tactip", help="Reference image sensor folder.")
+parser.add_argument("--reference_depth_path", type=str, default="", help="Override TacTip no-deformation depth .npy.")
+parser.add_argument("--indentation_depth", type=float, default=0.0008, help="Target TacTip indentation depth into the object surface in meters.")
+parser.add_argument(
+    "--surface_clearance",
+    type=float,
+    default=0.0040,
+    help="Pre-contact stand-off gap in meters. The final touch target still presses by indentation_depth.",
+)
+parser.add_argument(
+    "--robot_approach_offset",
+    type=float,
+    default=0.030,
+    help="Extra offset in meters along the contact normal for the pre-contact approach pose.",
+)
+parser.add_argument(
+    "--robot_approach_steps",
+    type=int,
+    default=4,
+    help="Number of linear approach waypoints from pre-contact to touch, similar to TouchSDF's staged spherical touch.",
+)
+parser.add_argument(
+    "--robot_joint_step_size",
+    type=float,
+    default=0.080,
+    help="Joint-space step size in radians per IK update, used to mimic TouchSDF-style blocking joint moves.",
+)
+parser.add_argument(
+    "--robot_touch_trigger_ratio",
+    type=float,
+    default=0.70,
+    help="Expected minimum center deformation ratio after the final touch pose is reached.",
+)
+parser.add_argument(
+    "--robot_joint_limit_margin",
+    type=float,
+    default=0.05,
+    help="Safety margin in radians kept away from UR5 joint limits.",
+)
+parser.add_argument(
+    "--robot_object_clearance",
+    type=float,
+    default=0.012,
+    help="Minimum clearance in meters between non-tip UR5 links and the active object bounding volume.",
+)
+parser.add_argument(
+    "--robot_body_clearance",
+    type=float,
+    default=0.060,
+    help="Conservative body-radius clearance for non-tip UR5 link segments around the active object.",
+)
+parser.add_argument(
+    "--robot_transit_height",
+    type=float,
+    default=0.32,
+    help="Minimum high-transit height in meters above the object top before lateral/vertical moves.",
+)
+parser.add_argument(
+    "--robot_lateral_clearance",
+    type=float,
+    default=0.18,
+    help="Lateral clearance in meters outside the object bounding box for obstacle-avoiding waypoints.",
+)
+parser.add_argument(
+    "--robot_ellipsoid_clearance",
+    type=float,
+    default=0.18,
+    help="Clearance added to the object bounding ellipsoid for the TacTip staging pose before inward contact.",
+)
+parser.add_argument(
+    "--robot_planner_skip_direct",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Use high side waypoints before direct contact moves. Disabled by default because the UR5 is pre-positioned above the object.",
+)
+parser.add_argument(
+    "--disable_robot_object_collision_guard",
+    action="store_true",
+    default=False,
+    help="Disable the geometric guard that prevents UR5 links from entering the object volume.",
+)
+parser.add_argument(
+    "--robot_home_preset",
+    choices=["touchsdf", "tactile_lab"],
+    default="touchsdf",
+    help=(
+        "Initial UR5 standard-TacTip joint pose. 'touchsdf' is based on tactile_gym's "
+        "ur5/tactip/standard rest_poses.py; 'tactile_lab' uses the local Isaac asset config."
+    ),
+)
+parser.add_argument(
+    "--robot_home_base_joint",
+    type=float,
+    default=float("nan"),
+    help="Override the initial UR5 base_joint in radians. NaN keeps the TouchSDF/tactile_gym preset value.",
+)
+parser.add_argument("--max_deformation_depth", type=float, default=0.006, help="Maximum physically plausible gel displacement.")
+parser.add_argument("--deformation_scale", type=float, default=1.0 / 0.0097, help="Scale for abs(current-reference).")
+parser.add_argument("--camera_distance", type=float, default=0.035, help="Legacy proxy camera eye distance from contact.")
+parser.add_argument("--depth_span", type=float, default=0.035, help="Legacy proxy depth normalization span.")
+parser.add_argument("--near_plane", type=float, default=0.001, help="Camera near clipping plane.")
+parser.add_argument("--far_plane", type=float, default=0.20, help="Camera far clipping plane.")
+parser.add_argument("--focal_length", type=float, default=26.5, help="Pinhole camera focal length in mm.")
+parser.add_argument("--horizontal_aperture", type=float, default=20.955, help="Pinhole camera aperture in mm.")
+parser.add_argument("--seed", type=int, default=41, help="Random seed.")
+parser.add_argument("--reset_output", action="store_true", default=False, help="Delete existing output folder first.")
+parser.add_argument("--save_png", action="store_true", default=False, help="Save tactile images as PNGs.")
+parser.add_argument("--save_per_sample_npy", action="store_true", default=False, help="Also save one .npy dict per chart.")
+parser.add_argument("--render_steps", type=int, default=2, help="Simulation/render steps per camera pose.")
+parser.add_argument("--visualize_sampling", action="store_true", default=False, help="Draw live sampling markers in Isaac Sim.")
+parser.add_argument("--visualize_sampling_pause", type=float, default=0.0, help="Seconds to pause after each live sampling update.")
+parser.add_argument("--visualize_startup_pause", type=float, default=2.0, help="Seconds to keep the first object framed before sampling.")
+parser.add_argument("--visualize_marker_scale", type=float, default=0.010, help="Marker radius/width for live sampling visualization.")
+parser.add_argument("--visualize_prepass_contacts", type=int, default=12, help="Candidate touches to animate before starting depth rendering.")
+parser.add_argument("--visualize_prepass_pause", type=float, default=0.18, help="Seconds per candidate in the lightweight prepass animation.")
+parser.add_argument("--visualize_each_candidate", action="store_true", default=False, help="Also animate every attempted candidate during data collection.")
+parser.add_argument("--visualize_follow_contact", action="store_true", default=False, help="Move the Isaac viewport camera to each contact. Disabled by default to keep the scene stable.")
+parser.add_argument(
+    "--visualize_point_markers",
+    action="store_true",
+    default=False,
+    help="Draw candidate/history/patch point markers during live sampling. Disabled by default.",
+)
+parser.add_argument(
+    "--visualize_direction_lines",
+    action="store_true",
+    default=False,
+    help="Draw press/camera direction lines during live sampling. Disabled by default.",
+)
+parser.add_argument(
+    "--standby_hover_gap",
+    type=float,
+    default=0.030,
+    help="Extra hover distance in meters above the object-top standby pose between samples.",
+)
+parser.add_argument(
+    "--robot_initial_hover_height",
+    type=float,
+    default=0.20,
+    help="Pipeline-style initial TCP height above the object center before each touch.",
+)
+parser.add_argument(
+    "--visual_tactip",
+    action="store_true",
+    default=False,
+    help="Deprecated compatibility flag. Live visualization now uses the real UR5+TacTip asset instead of a procedural probe.",
+)
+parser.add_argument(
+    "--spawn_ur5_tactip",
+    action="store_true",
+    default=False,
+    help="Spawn the built-in UR5+TacTip workcell selected from --sensor_type for live visualization.",
+)
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+
+if args_cli.start_object_index < 0:
+    parser.error("--start_object_index cannot be negative.")
+if args_cli.max_objects < 0:
+    parser.error("--max_objects cannot be negative.")
+if args_cli.charts_per_object < 1:
+    parser.error("--charts_per_object must be at least 1.")
+if args_cli.total_target_charts < 1:
+    parser.error("--total_target_charts must be at least 1.")
+if args_cli.points_per_touch < 1:
+    parser.error("--points_per_touch must be at least 1.")
+if args_cli.tactile_img_size < 4:
+    parser.error("--tactile_img_size must be at least 4.")
+if args_cli.contact_azimuth_bins < 1:
+    parser.error("--contact_azimuth_bins must be at least 1.")
+if args_cli.contact_elevation_bins < 1:
+    parser.error("--contact_elevation_bins must be at least 1.")
+if args_cli.contact_oversample_factor < 1:
+    parser.error("--contact_oversample_factor must be at least 1.")
+if args_cli.contact_min_elevation_deg >= args_cli.contact_max_elevation_deg:
+    parser.error("--contact_min_elevation_deg must be smaller than --contact_max_elevation_deg.")
+if args_cli.robot_object_clearance < 0.0:
+    parser.error("--robot_object_clearance cannot be negative.")
+if args_cli.robot_body_clearance < 0.0:
+    parser.error("--robot_body_clearance cannot be negative.")
+if args_cli.robot_transit_height < 0.0:
+    parser.error("--robot_transit_height cannot be negative.")
+if args_cli.robot_lateral_clearance < 0.0:
+    parser.error("--robot_lateral_clearance cannot be negative.")
+if args_cli.robot_ellipsoid_clearance < 0.0:
+    parser.error("--robot_ellipsoid_clearance cannot be negative.")
+
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import cv2
+import numpy as np
+import torch
+import trimesh
+from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation
+
+import isaacsim.core.utils.prims as prim_utils
+import isaacsim.core.utils.stage as stage_utils
+import isaaclab.sim as sim_utils
+from isaaclab.assets import Articulation
+from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+from isaaclab.sensors.camera import TiledCamera, TiledCameraCfg
+from isaaclab.utils.math import combine_frame_transforms, compute_pose_error, subtract_frame_transforms
+from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics
+
+
+_ORIGINAL_TILED_CAMERA_DEL = getattr(TiledCamera, "__del__", None)
+
+
+def _safe_tiled_camera_del(self):
+    if _ORIGINAL_TILED_CAMERA_DEL is None:
+        return
+    try:
+        _ORIGINAL_TILED_CAMERA_DEL(self)
+    except AttributeError as exc:
+        if "_annotators" not in str(exc):
+            raise
+
+
+TiledCamera.__del__ = _safe_tiled_camera_del
+
+
+_SAMPLING_VIZ_CONTACTS: list[np.ndarray] = []
+_UR5_TACTIP_VISUALS_SPAWNED = False
+_UR5_TACTIP_VISUAL_ASSET = ""
+_UR5_TACTIP_ARTICULATION: Articulation | None = None
+_UR5_TACTIP_IK_CONTROLLER: DifferentialIKController | None = None
+_UR5_TACTIP_JOINT_IDS: list[int] = []
+_UR5_TACTIP_JOINT_NAMES: list[str] = []
+_UR5_TACTIP_TCP_BODY_ID: int | None = None
+_UR5_TACTIP_SENSOR_BODY_ID: int | None = None
+_UR5_TACTIP_EE_JACOBI_IDX: int | None = None
+_UR5_TACTIP_SENSOR_OFFSET_POS: torch.Tensor | None = None
+_UR5_TACTIP_SENSOR_OFFSET_QUAT: torch.Tensor | None = None
+_UR5_TACTIP_BODY_ID_CACHE: dict[str, int] = {}
+_UR5_OBJECT_GUARD_BODY_ID_CACHE: dict[str, int] = {}
+_VIEWPORT_FRAMED_ONCE = False
+_STANDBY_SENSOR_POS_W: np.ndarray | None = None
+_STANDBY_SENSOR_QUAT_WXYZ: np.ndarray | None = None
+_STANDBY_TCP_POS_W: np.ndarray | None = None
+_STANDBY_TCP_QUAT_WXYZ: np.ndarray | None = None
+_STANDBY_LABEL = ""
+_ACTIVE_OBJECT_BOUNDS: np.ndarray | None = None
+_ACTIVE_OBJECT_LABEL = ""
+_LAST_VIEWPORT_EYE: np.ndarray | None = None
+_LAST_VIEWPORT_TARGET: np.ndarray | None = None
+
+_UR5_SELF_COLLISION_GUARDS = (
+    ("base_link", "wrist_3_link", 0.10),
+    ("base_link", "tactip_body_link", 0.26),
+    ("base_link", "tactip_tip_link", 0.24),
+    ("shoulder_link", "wrist_2_link", 0.09),
+    ("shoulder_link", "wrist_3_link", 0.08),
+    ("shoulder_link", "tactip_body_link", 0.18),
+    ("upper_arm_link", "tactip_body_link", 0.12),
+    ("forearm_link", "tactip_body_link", 0.08),
+    ("forearm_link", "tactip_tip_link", 0.07),
+)
+
+_UR5_OBJECT_GUARD_CHAIN = (
+    "base_link",
+    "shoulder_link",
+    "upper_arm_link",
+    "forearm_link",
+    "wrist_1_link",
+    "wrist_2_link",
+    "wrist_3_link",
+    "ee_link",
+    "tactip_body_link",
+)
+_UR5_OBJECT_GUARD_TIP_BODIES = {"tactip_tip_link", "elastomer_tip", "tcp_link"}
+
+_UR5_RA_TACTIP_INITIAL_JOINT_POSITIONS = {
+    "base_joint": -0.29460139,
+    "shoulder_joint": -2.13012475,
+    "elbow_joint": -1.76061934,
+    "wrist_1_joint": -0.82164851,
+    "wrist_2_joint": 1.5717,
+    "wrist_3_joint": 4.41624829,
+}
+
+_UR5_STANDARD_TACTIP_TOUCHSDF_INITIAL_JOINT_POSITIONS = {
+    "base_joint": 0.166827,
+    "shoulder_joint": -2.16515,
+    "elbow_joint": -1.64365,
+    "wrist_1_joint": -0.90317,
+    "wrist_2_joint": 1.57315,
+    "wrist_3_joint": 1.74001,
+}
+
+_UR5_STANDARD_TACTIP_TACTILE_LAB_INITIAL_JOINT_POSITIONS = {
+    "base_joint": 0.1688,
+    "shoulder_joint": -2.1589,
+    "elbow_joint": -1.6435,
+    "wrist_1_joint": -0.9086,
+    "wrist_2_joint": 1.5717,
+    "wrist_3_joint": -2.9538,
+}
+
+_RIGHT_ANGLE_TCP_TO_SENSOR_OFFSET_POS = (0.0, -0.065, 0.0)
+_RIGHT_ANGLE_TCP_TO_SENSOR_OFFSET_QUAT = (-0.707, 0.707, 0.0, 0.0)
+_STANDARD_TCP_TO_SENSOR_OFFSET_POS = (0.0, 0.0, -0.065)
+_STANDARD_TCP_TO_SENSOR_OFFSET_QUAT = (0.70682518, 0.0, 0.00112618, -0.70738737)
+_TOUCHSDF_HIGH_OFFSET_WRLD = 0.2
+_TOUCHSDF_DEFAULT_TCP_RPY_WRLD = (3.14, 0.0, 1.57)
+
+
+def _split_filter(text: str) -> set[str]:
+    return {item.strip() for item in text.split(",") if item.strip()}
+
+
+def _using_right_angle_tactip() -> bool:
+    return "right_angle" in args_cli.sensor_type.lower()
+
+
+def _selected_robot_joint_positions() -> dict[str, float]:
+    if _using_right_angle_tactip():
+        joint_positions = dict(_UR5_RA_TACTIP_INITIAL_JOINT_POSITIONS)
+        if np.isfinite(float(args_cli.robot_home_base_joint)):
+            joint_positions["base_joint"] = float(args_cli.robot_home_base_joint)
+        return joint_positions
+    if args_cli.robot_home_preset == "tactile_lab":
+        joint_positions = dict(_UR5_STANDARD_TACTIP_TACTILE_LAB_INITIAL_JOINT_POSITIONS)
+    else:
+        joint_positions = dict(_UR5_STANDARD_TACTIP_TOUCHSDF_INITIAL_JOINT_POSITIONS)
+    if np.isfinite(float(args_cli.robot_home_base_joint)):
+        joint_positions["base_joint"] = float(args_cli.robot_home_base_joint)
+    return joint_positions
+
+
+def _selected_robot_joint_preset_name() -> str:
+    base_override = float(args_cli.robot_home_base_joint)
+    base_label = "preset" if not np.isfinite(base_override) else f"{base_override:+.3f}"
+    if _using_right_angle_tactip():
+        return f"right_angle_tactile_lab_base_{base_label}"
+    return f"standard_{args_cli.robot_home_preset}_base_{base_label}"
+
+
+def _selected_tcp_to_sensor_offset() -> tuple[tuple[float, float, float], tuple[float, float, float, float], str]:
+    if _using_right_angle_tactip():
+        return (
+            _RIGHT_ANGLE_TCP_TO_SENSOR_OFFSET_POS,
+            _RIGHT_ANGLE_TCP_TO_SENSOR_OFFSET_QUAT,
+            "right_angle_tactip Obj-Push offset",
+        )
+    return (
+        _STANDARD_TCP_TO_SENSOR_OFFSET_POS,
+        _STANDARD_TCP_TO_SENSOR_OFFSET_QUAT,
+        "standard_tactip EdgeFollow/CollectDepth offset",
+    )
+
+
+def _dataset_name() -> str:
+    name = args_cli.name_output.strip()
+    if not name:
+        name = "isaac_shapenet_tactip_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not name.startswith("touch_charts_gt_"):
+        name = "touch_charts_gt_" + name
+    return name
+
+
+def _make_output_dir() -> tuple[str, Path]:
+    dataset_name = _dataset_name()
+    if args_cli.output_root:
+        output_root = Path(args_cli.output_root).expanduser().resolve()
+    elif args_cli.touchsdf_root:
+        output_root = Path(args_cli.touchsdf_root).expanduser().resolve() / "results"
+    else:
+        output_root = Path("outputs/touch_charts").resolve()
+
+    output_dir = output_root / dataset_name
+    if output_dir.exists() and args_cli.reset_output:
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if args_cli.save_png:
+        (output_dir / "images").mkdir(exist_ok=True)
+    return dataset_name, output_dir
+
+
+def _find_meshes(root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for pattern in ("*/**/models/model_normalized.obj", "*/**/model_normalized.obj", "*/**/model.obj"):
+        candidates.extend(root.glob(pattern))
+
+    seen = set()
+    meshes = []
+    category_filter = _split_filter(args_cli.category_ids)
+    object_filter = _split_filter(args_cli.object_ids)
+
+    for mesh_path in sorted(candidates):
+        resolved = mesh_path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        category_id, object_id = _mesh_ids(root, mesh_path)
+        if category_filter and category_id not in category_filter:
+            continue
+        if object_filter and object_id not in object_filter:
+            continue
+        meshes.append(mesh_path)
+
+    start = args_cli.start_object_index
+    end = None if args_cli.max_objects == 0 else start + args_cli.max_objects
+    return meshes[start:end]
+
+
+def _mesh_ids(root: Path, mesh_path: Path) -> tuple[str, str]:
+    rel = mesh_path.relative_to(root).parts
+    if len(rel) >= 5 and rel[-2] == "models":
+        return rel[0], rel[-3]
+    if len(rel) >= 3:
+        return rel[0], rel[-2]
+    return "unknown", mesh_path.parent.name
+
+
+def _load_scaled_mesh(mesh_path: Path) -> trimesh.Trimesh:
+    mesh = trimesh.load(mesh_path, force="mesh", process=True)
+    if not isinstance(mesh, trimesh.Trimesh) or mesh.vertices.size == 0 or mesh.faces.size == 0:
+        raise ValueError(f"Invalid mesh: {mesh_path}")
+    mesh.remove_unreferenced_vertices()
+    mesh.fix_normals()
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    bounds_min = vertices.min(axis=0)
+    bounds_max = vertices.max(axis=0)
+    center = 0.5 * (bounds_min + bounds_max)
+    vertices = (vertices - center) * args_cli.scale
+    vertices += np.array([args_cli.object_world_x, args_cli.object_world_y, args_cli.object_world_z], dtype=np.float64)
+    if args_cli.object_bottom_z is not None:
+        target_bottom_z = float(args_cli.object_world_z) + float(args_cli.object_bottom_z)
+        vertices[:, 2] += target_bottom_z - float(vertices[:, 2].min())
+    return trimesh.Trimesh(vertices=vertices, faces=np.asarray(mesh.faces), process=False)
+
+
+def _mesh_bbox_center(mesh: trimesh.Trimesh) -> np.ndarray:
+    bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    return 0.5 * (bounds[0] + bounds[1])
+
+
+def _set_active_object_collision_guard(mesh: trimesh.Trimesh, label: str):
+    global _ACTIVE_OBJECT_BOUNDS, _ACTIVE_OBJECT_LABEL
+    _ACTIVE_OBJECT_BOUNDS = np.asarray(mesh.bounds, dtype=np.float64).copy()
+    _ACTIVE_OBJECT_LABEL = label
+    extent = _ACTIVE_OBJECT_BOUNDS[1] - _ACTIVE_OBJECT_BOUNDS[0]
+    print(
+        "[SAFE] object penetration guard active "
+        f"{label}: bounds_min=({_ACTIVE_OBJECT_BOUNDS[0, 0]:+.3f}, {_ACTIVE_OBJECT_BOUNDS[0, 1]:+.3f}, {_ACTIVE_OBJECT_BOUNDS[0, 2]:+.3f}) "
+        f"bounds_max=({_ACTIVE_OBJECT_BOUNDS[1, 0]:+.3f}, {_ACTIVE_OBJECT_BOUNDS[1, 1]:+.3f}, {_ACTIVE_OBJECT_BOUNDS[1, 2]:+.3f}) "
+        f"extent=({extent[0]:.3f}, {extent[1]:.3f}, {extent[2]:.3f}) "
+        f"clearance={max(float(args_cli.robot_object_clearance), 0.0):.3f}m",
+        flush=True,
+    )
+
+
+def _clear_active_object_collision_guard():
+    global _ACTIVE_OBJECT_BOUNDS, _ACTIVE_OBJECT_LABEL
+    _ACTIVE_OBJECT_BOUNDS = None
+    _ACTIVE_OBJECT_LABEL = ""
+
+
+def _point_inside_active_object_bounds(point: np.ndarray, clearance: float) -> bool:
+    if _ACTIVE_OBJECT_BOUNDS is None:
+        return False
+    point = np.asarray(point, dtype=np.float64).reshape(3)
+    clearance = max(float(clearance), 0.0)
+    lower = _ACTIVE_OBJECT_BOUNDS[0] - clearance
+    upper = _ACTIVE_OBJECT_BOUNDS[1] + clearance
+    return bool(np.all(point >= lower) and np.all(point <= upper))
+
+
+def _point_distance_to_active_object_bounds(point: np.ndarray) -> float:
+    if _ACTIVE_OBJECT_BOUNDS is None:
+        return float("inf")
+    point = np.asarray(point, dtype=np.float64).reshape(3)
+    lower = _ACTIVE_OBJECT_BOUNDS[0]
+    upper = _ACTIVE_OBJECT_BOUNDS[1]
+    delta = np.maximum(np.maximum(lower - point, point - upper), 0.0)
+    return float(np.linalg.norm(delta))
+
+
+def _select_farthest_contacts(
+    contacts: np.ndarray,
+    outward_dirs: np.ndarray,
+    target_count: int,
+    bbox_center: np.ndarray,
+    seed_top: bool = True,
+) -> np.ndarray:
+    num_candidates = int(contacts.shape[0])
+    if num_candidates <= target_count:
+        return np.arange(num_candidates, dtype=np.int64)
+
+    shuffled = np.random.permutation(num_candidates)
+    contacts = contacts[shuffled]
+    outward_dirs = outward_dirs[shuffled]
+
+    if seed_top:
+        top_pool_size = max(min(num_candidates // 3, 16), 1)
+        top_pool = np.argsort(-contacts[:, 2])[:top_pool_size]
+        selected = [int(np.random.choice(top_pool))]
+    else:
+        selected = [int(np.random.randint(0, num_candidates))]
+
+    min_dist = np.full(num_candidates, np.inf, dtype=np.float64)
+    max_extent = max(float(np.linalg.norm(contacts.max(axis=0) - contacts.min(axis=0))), 1.0e-6)
+
+    while len(selected) < target_count:
+        last = selected[-1]
+        spatial_dist = np.linalg.norm(contacts - contacts[last], axis=1) / max_extent
+        min_dist = np.minimum(min_dist, spatial_dist)
+        selected_dirs = outward_dirs[np.asarray(selected, dtype=np.int64)]
+        angular_dist = 1.0 - np.max(np.clip(outward_dirs @ selected_dirs.T, -1.0, 1.0), axis=1)
+        min_dist[selected] = -np.inf
+        angular_dist[selected] = -np.inf
+        z_bonus = np.maximum(contacts[:, 2] - bbox_center[2], 0.0)
+        score = 0.55 * min_dist + 0.40 * angular_dist + 0.05 * z_bonus
+        next_idx = int(np.argmax(score))
+        if not np.isfinite(score[next_idx]) or next_idx in selected:
+            break
+        selected.append(next_idx)
+
+    return shuffled[np.asarray(selected[:target_count], dtype=np.int64)]
+
+
+def _contact_direction_stats(outward_dirs: np.ndarray) -> str:
+    if outward_dirs.size == 0:
+        return "angles=empty"
+    dirs = np.asarray(outward_dirs, dtype=np.float64)
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True) + 1.0e-12
+    az = (np.degrees(np.arctan2(dirs[:, 1], dirs[:, 0])) + 360.0) % 360.0
+    el = np.degrees(np.arcsin(np.clip(dirs[:, 2], -1.0, 1.0)))
+    az_bins = max(int(args_cli.contact_azimuth_bins), 1)
+    el_bins = max(int(args_cli.contact_elevation_bins), 1)
+    az_ids = np.floor(az / 360.0 * az_bins).astype(np.int64)
+    el_min = float(args_cli.contact_min_elevation_deg)
+    el_max = float(args_cli.contact_max_elevation_deg)
+    el_span = max(el_max - el_min, 1.0e-6)
+    el_ids = np.floor(np.clip((el - el_min) / el_span, 0.0, 0.999999) * el_bins).astype(np.int64)
+    occupied = {(int(a), int(e)) for a, e in zip(az_ids, el_ids)}
+    return (
+        f"azimuth=({az.min():.1f},{az.max():.1f})deg "
+        f"elevation=({el.min():.1f},{el.max():.1f})deg "
+        f"az_bins={len(set(az_ids.tolist()))}/{az_bins} "
+        f"angle_bins={len(occupied)}/{az_bins * el_bins}"
+    )
+
+
+def _sample_accessible_contacts(mesh: trimesh.Trimesh, target_count: int) -> tuple[np.ndarray, np.ndarray]:
+    target_count = max(int(target_count), 1)
+    bbox_center = _mesh_bbox_center(mesh)
+    oversample = max(target_count * max(int(args_cli.contact_oversample_factor), 1), 256)
+    sampled_contacts, face_ids = trimesh.sample.sample_surface(mesh, oversample)
+    sampled_contacts = np.asarray(sampled_contacts, dtype=np.float64)
+    face_normals = np.asarray(mesh.face_normals[face_ids], dtype=np.float64)
+
+    contacts_list: list[np.ndarray] = []
+    outward_list: list[np.ndarray] = []
+    top_contacts: list[np.ndarray] = []
+    top_outward: list[np.ndarray] = []
+
+    for contact, face_normal in zip(sampled_contacts, face_normals):
+        outward = np.asarray(contact, dtype=np.float64) - bbox_center
+        outward_norm = np.linalg.norm(outward)
+        if outward_norm < 1.0e-8:
+            outward = np.asarray(face_normal, dtype=np.float64)
+            outward_norm = np.linalg.norm(outward)
+        if outward_norm < 1.0e-8:
+            continue
+        outward /= outward_norm
+
+        contacts_list.append(contact.astype(np.float32))
+        outward_list.append(outward.astype(np.float32))
+
+        if outward[2] >= 0.18 and contact[2] >= bbox_center[2] - 0.01:
+            top_contacts.append(contact.astype(np.float32))
+            top_outward.append(outward.astype(np.float32))
+
+    if not contacts_list:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+
+    all_contacts = np.stack(contacts_list, axis=0).astype(np.float32)
+    all_outward = np.stack(outward_list, axis=0).astype(np.float32)
+
+    if args_cli.contact_sampling_strategy == "top_farthest":
+        if len(top_contacts) >= target_count:
+            contacts = np.stack(top_contacts, axis=0)
+            outward_dirs = np.stack(top_outward, axis=0)
+        else:
+            contacts = all_contacts
+            outward_dirs = all_outward
+        selected = _select_farthest_contacts(contacts, outward_dirs, target_count, bbox_center, seed_top=True)
+        return contacts[selected].astype(np.float32), outward_dirs[selected].astype(np.float32)
+
+    dirs = all_outward.astype(np.float64)
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True) + 1.0e-12
+    elevation = np.degrees(np.arcsin(np.clip(dirs[:, 2], -1.0, 1.0)))
+    min_el = float(args_cli.contact_min_elevation_deg)
+    max_el = float(args_cli.contact_max_elevation_deg)
+    upper_mask = (elevation >= min_el) & (elevation <= max_el)
+    if int(np.count_nonzero(upper_mask)) < target_count:
+        upper_mask = elevation >= min(-5.0, min_el)
+    candidate_indices = np.flatnonzero(upper_mask)
+    if candidate_indices.size == 0:
+        candidate_indices = np.arange(all_contacts.shape[0], dtype=np.int64)
+
+    candidate_dirs = dirs[candidate_indices]
+    candidate_az = (np.degrees(np.arctan2(candidate_dirs[:, 1], candidate_dirs[:, 0])) + 360.0) % 360.0
+    candidate_el = elevation[candidate_indices]
+    az_bins = max(int(args_cli.contact_azimuth_bins), 1)
+    el_bins = max(int(args_cli.contact_elevation_bins), 1)
+    el_span = max(max_el - min_el, 1.0e-6)
+
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for local_idx, global_idx in enumerate(candidate_indices):
+        az_bin = int(np.floor(candidate_az[local_idx] / 360.0 * az_bins)) % az_bins
+        el_bin = int(np.floor(np.clip((candidate_el[local_idx] - min_el) / el_span, 0.0, 0.999999) * el_bins))
+        buckets.setdefault((el_bin, az_bin), []).append(int(global_idx))
+
+    for bucket_indices in buckets.values():
+        np.random.shuffle(bucket_indices)
+
+    selected: list[int] = []
+    bucket_keys = list(buckets.keys())
+    np.random.shuffle(bucket_keys)
+    while len(selected) < target_count and bucket_keys:
+        next_keys: list[tuple[int, int]] = []
+        for key in bucket_keys:
+            bucket = buckets[key]
+            if bucket:
+                selected.append(bucket.pop())
+                if len(selected) >= target_count:
+                    break
+            if bucket:
+                next_keys.append(key)
+        bucket_keys = next_keys
+
+    if len(selected) < min(target_count, candidate_indices.size):
+        candidate_contacts = all_contacts[candidate_indices]
+        candidate_outward = all_outward[candidate_indices]
+        selected_local = [
+            int(np.where(candidate_indices == idx)[0][0])
+            for idx in selected
+            if np.any(candidate_indices == idx)
+        ]
+        remaining_local = _select_farthest_contacts(
+            candidate_contacts,
+            candidate_outward,
+            target_count,
+            bbox_center,
+            seed_top=False,
+        )
+        for local_idx in remaining_local:
+            global_idx = int(candidate_indices[int(local_idx)])
+            if global_idx not in selected:
+                selected.append(global_idx)
+            if len(selected) >= target_count:
+                break
+
+    selected_arr = np.asarray(selected[:target_count], dtype=np.int64)
+    return all_contacts[selected_arr].astype(np.float32), all_outward[selected_arr].astype(np.float32)
+
+
+def _touchsdf_ray_hemisphere(mesh: trimesh.Trimesh) -> float:
+    bounds = np.asarray(mesh.bounding_box.bounds, dtype=np.float64)
+    diameter = float(np.linalg.norm(bounds[1] - bounds[0]))
+    return 0.5 * diameter * 1.1
+
+
+def _touchsdf_sample_sphere(radius: float) -> tuple[np.ndarray, np.ndarray]:
+    phi = 2.0 * np.pi * np.random.uniform()
+    theta = np.arccos(1.0 - 2.0 * np.random.uniform())
+    coords = np.array(
+        [
+            radius * np.sin(theta) * np.cos(phi),
+            radius * np.sin(theta) * np.sin(phi),
+            radius * np.cos(theta),
+        ],
+        dtype=np.float64,
+    )
+    return coords, np.array([phi, theta], dtype=np.float64)
+
+
+def _touchsdf_sphere_frame(angles: np.ndarray) -> np.ndarray:
+    phi, theta = np.asarray(angles, dtype=np.float64).reshape(2)
+    return np.array(
+        [
+            [-np.sin(phi), np.cos(theta) * np.cos(phi), -np.sin(theta) * np.cos(phi)],
+            [np.cos(phi), np.cos(theta) * np.sin(phi), -np.sin(theta) * np.sin(phi)],
+            [0.0, -np.sin(theta), -np.cos(theta)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _touchsdf_sphere_quat_wxyz(angles: np.ndarray) -> np.ndarray:
+    return _quat_wxyz_from_frame(_touchsdf_sphere_frame(angles))
+
+
+def _touchsdf_default_tcp_quat_wxyz() -> np.ndarray:
+    quat_xyzw = Rotation.from_euler("xyz", _TOUCHSDF_DEFAULT_TCP_RPY_WRLD).as_quat()
+    return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float32)
+
+
+def _touchsdf_first_surface_point_on_ray(
+    dense_points: np.ndarray,
+    sphere_pos: np.ndarray,
+    object_center: np.ndarray,
+) -> np.ndarray:
+    dense_points = np.asarray(dense_points, dtype=np.float64)
+    sphere_pos = np.asarray(sphere_pos, dtype=np.float64).reshape(3)
+    object_center = np.asarray(object_center, dtype=np.float64).reshape(3)
+    ray = object_center - sphere_pos
+    ray_len = float(np.linalg.norm(ray))
+    if ray_len < 1.0e-8 or dense_points.size == 0:
+        return object_center.astype(np.float32)
+    direction = ray / ray_len
+    rel = dense_points - sphere_pos[None, :]
+    t = rel @ direction
+    closest = sphere_pos[None, :] + t[:, None] * direction[None, :]
+    ray_dist = np.linalg.norm(dense_points - closest, axis=1)
+    forward = (t >= 0.0) & (t <= ray_len + 0.10)
+    if not np.any(forward):
+        return dense_points[int(np.argmin(np.linalg.norm(dense_points - object_center[None, :], axis=1)))].astype(np.float32)
+    forward_dist = ray_dist[forward]
+    min_dist = float(forward_dist.min())
+    near_ray = forward & (ray_dist <= max(min_dist * 1.5, 0.006))
+    if np.any(near_ray):
+        candidate_indices = np.flatnonzero(near_ray)
+        idx = int(candidate_indices[np.argmin(t[candidate_indices])])
+    else:
+        candidate_indices = np.flatnonzero(forward)
+        idx = int(candidate_indices[np.argmin(ray_dist[candidate_indices])])
+    return dense_points[idx].astype(np.float32)
+
+
+def _sample_touchsdf_spherical_contacts(
+    mesh: trimesh.Trimesh,
+    dense_points: np.ndarray,
+    target_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    target_count = max(int(target_count), 1)
+    object_center = _mesh_bbox_center(mesh).astype(np.float64)
+    ray_hemisphere = _touchsdf_ray_hemisphere(mesh)
+    attempts = max(target_count * max(int(args_cli.contact_oversample_factor), 1), target_count)
+
+    contacts: list[np.ndarray] = []
+    outward_dirs: list[np.ndarray] = []
+    sphere_positions: list[np.ndarray] = []
+    sphere_angles: list[np.ndarray] = []
+
+    for _ in range(attempts):
+        sphere_offset, angles = _touchsdf_sample_sphere(ray_hemisphere)
+        sphere_pos = object_center + sphere_offset
+        outward = sphere_pos - object_center
+        norm = float(np.linalg.norm(outward))
+        if norm < 1.0e-8:
+            continue
+        outward /= norm
+        contact = _touchsdf_first_surface_point_on_ray(dense_points, sphere_pos, object_center)
+        contacts.append(contact.astype(np.float32))
+        outward_dirs.append(outward.astype(np.float32))
+        sphere_positions.append(sphere_pos.astype(np.float32))
+        sphere_angles.append(angles.astype(np.float32))
+        if len(contacts) >= target_count:
+            break
+
+    if not contacts:
+        empty = np.zeros((0, 3), dtype=np.float32)
+        return empty, empty, empty, np.zeros((0, 2), dtype=np.float32), object_center.astype(np.float32)
+
+    return (
+        np.stack(contacts, axis=0).astype(np.float32),
+        np.stack(outward_dirs, axis=0).astype(np.float32),
+        np.stack(sphere_positions, axis=0).astype(np.float32),
+        np.stack(sphere_angles, axis=0).astype(np.float32),
+        object_center.astype(np.float32),
+    )
+
+
+def _reference_depth_path() -> Path:
+    if args_cli.reference_depth_path:
+        return Path(args_cli.reference_depth_path).expanduser().resolve()
+    return (
+        Path(__file__).resolve().parents[1]
+        / "source"
+        / "Tactile_Lab"
+        / "Tactile_Lab"
+        / "tactile_lab_assets"
+        / "reference_images"
+        / args_cli.sensor_type
+        / f"{args_cli.tactile_img_size}x{args_cli.tactile_img_size}"
+        / "nodef_dep.npy"
+    )
+
+
+def _load_reference_depth() -> np.ndarray:
+    path = _reference_depth_path()
+    if not path.exists():
+        raise FileNotFoundError(f"TacTip reference depth not found: {path}")
+    reference = np.load(path).astype(np.float32)
+    if reference.ndim == 3:
+        reference = reference[..., 0]
+    if reference.shape != (args_cli.tactile_img_size, args_cli.tactile_img_size):
+        raise ValueError(
+            f"Reference depth shape {reference.shape} does not match "
+            f"{args_cli.tactile_img_size}x{args_cli.tactile_img_size}: {path}"
+        )
+    return reference
+
+
+def _external_assets_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent.parent / "Tactile_Lab_External_Assets"
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError("Could not locate Tactile_Lab_External_Assets next to this repository.")
+
+
+def _spawn_mesh(mesh: trimesh.Trimesh):
+    stage = stage_utils.get_current_stage()
+    if stage.GetPrimAtPath("/World/Object").IsValid():
+        prim_utils.delete_prim("/World/Object")
+    mesh_prim = UsdGeom.Mesh.Define(stage, "/World/Object")
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    mesh_prim.CreatePointsAttr([Gf.Vec3f(float(x), float(y), float(z)) for x, y, z in vertices])
+    mesh_prim.CreateFaceVertexCountsAttr([3] * len(faces))
+    mesh_prim.CreateFaceVertexIndicesAttr(faces.reshape(-1).tolist())
+    mesh_prim.CreateDisplayColorAttr([Gf.Vec3f(0.62, 0.68, 0.76)])
+
+
+def _refresh_ur5_tactip_articulation(sim: sim_utils.SimulationContext):
+    if _UR5_TACTIP_ARTICULATION is not None:
+        _UR5_TACTIP_ARTICULATION.update(sim.get_physics_dt())
+
+
+def _torch_pose_from_numpy(position: np.ndarray, quat_wxyz: np.ndarray, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    pos_t = torch.tensor(np.asarray(position, dtype=np.float32).reshape(1, 3), device=device, dtype=torch.float32)
+    quat_t = torch.tensor(np.asarray(quat_wxyz, dtype=np.float32).reshape(1, 4), device=device, dtype=torch.float32)
+    return pos_t, quat_t
+
+
+def _quat_wxyz_from_frame(rot_m: np.ndarray) -> np.ndarray:
+    quat_xyzw = Rotation.from_matrix(rot_m).as_quat()
+    return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float32)
+
+
+def _quat_wxyz_from_contact_normal(contact: np.ndarray, normal: np.ndarray) -> np.ndarray:
+    return _quat_wxyz_from_frame(
+        _frame_from_normal(
+            np.asarray(normal, dtype=np.float64),
+            np.asarray(contact, dtype=np.float64),
+        )
+    )
+
+
+def _quat_wxyz_for_world_down(contact_hint: np.ndarray | None = None) -> np.ndarray:
+    if contact_hint is None:
+        contact_hint = np.array([args_cli.object_world_x, args_cli.object_world_y, args_cli.object_world_z], dtype=np.float64)
+    return _quat_wxyz_from_frame(
+        _frame_from_normal(
+            np.array([0.0, 0.0, 1.0], dtype=np.float64),
+            np.asarray(contact_hint, dtype=np.float64),
+        )
+    )
+
+
+def _sensor_pose_from_tcp_pose(tcp_pos_w: np.ndarray, tcp_quat_wxyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    sensor_offset_pos, sensor_offset_quat, _ = _selected_tcp_to_sensor_offset()
+    tcp_pos_w = np.asarray(tcp_pos_w, dtype=np.float64).reshape(3)
+    tcp_quat_wxyz = np.asarray(tcp_quat_wxyz, dtype=np.float64).reshape(4)
+    tcp_rot = Rotation.from_quat(
+        np.array([tcp_quat_wxyz[1], tcp_quat_wxyz[2], tcp_quat_wxyz[3], tcp_quat_wxyz[0]], dtype=np.float64)
+    )
+    sensor_rot_local = Rotation.from_quat(
+        np.array([sensor_offset_quat[1], sensor_offset_quat[2], sensor_offset_quat[3], sensor_offset_quat[0]], dtype=np.float64)
+    )
+    sensor_pos_w = tcp_pos_w + tcp_rot.apply(np.asarray(sensor_offset_pos, dtype=np.float64))
+    sensor_quat_xyzw = (tcp_rot * sensor_rot_local).as_quat()
+    sensor_quat_wxyz = np.array(
+        [sensor_quat_xyzw[3], sensor_quat_xyzw[0], sensor_quat_xyzw[1], sensor_quat_xyzw[2]],
+        dtype=np.float32,
+    )
+    return sensor_pos_w.astype(np.float32), sensor_quat_wxyz
+
+
+def _tcp_pose_from_sensor_pose(sensor_pos_w: np.ndarray, sensor_quat_wxyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    sensor_offset_pos, sensor_offset_quat, _ = _selected_tcp_to_sensor_offset()
+    sensor_pos_w = np.asarray(sensor_pos_w, dtype=np.float64).reshape(3)
+    sensor_quat_wxyz = np.asarray(sensor_quat_wxyz, dtype=np.float64).reshape(4)
+    sensor_rot = Rotation.from_quat(
+        np.array([sensor_quat_wxyz[1], sensor_quat_wxyz[2], sensor_quat_wxyz[3], sensor_quat_wxyz[0]], dtype=np.float64)
+    )
+    sensor_rot_local = Rotation.from_quat(
+        np.array([sensor_offset_quat[1], sensor_offset_quat[2], sensor_offset_quat[3], sensor_offset_quat[0]], dtype=np.float64)
+    )
+    tcp_rot = sensor_rot * sensor_rot_local.inv()
+    tcp_pos_w = sensor_pos_w - tcp_rot.apply(np.asarray(sensor_offset_pos, dtype=np.float64))
+    tcp_quat_xyzw = tcp_rot.as_quat()
+    tcp_quat_wxyz = np.array(
+        [tcp_quat_xyzw[3], tcp_quat_xyzw[0], tcp_quat_xyzw[1], tcp_quat_xyzw[2]],
+        dtype=np.float32,
+    )
+    return tcp_pos_w.astype(np.float32), tcp_quat_wxyz
+
+
+def _pump_gui(sim: sim_utils.SimulationContext, seconds: float, min_steps: int = 1):
+    if getattr(args_cli, "headless", False):
+        return
+    deadline = time.perf_counter() + max(float(seconds), 0.0)
+    steps = 0
+    while simulation_app.is_running():
+        if seconds <= 0.0 and steps >= min_steps:
+            break
+        if seconds > 0.0 and time.perf_counter() >= deadline and steps >= min_steps:
+            break
+        sim.step()
+        _refresh_ur5_tactip_articulation(sim)
+        steps += 1
+        if seconds > 0.0:
+            time.sleep(0.015)
+
+
+def _focus_viewport(sim: sim_utils.SimulationContext, eye: np.ndarray, target: np.ndarray):
+    global _LAST_VIEWPORT_EYE, _LAST_VIEWPORT_TARGET
+    if getattr(args_cli, "headless", False):
+        return
+    _LAST_VIEWPORT_EYE = np.asarray(eye, dtype=np.float64).reshape(3).copy()
+    _LAST_VIEWPORT_TARGET = np.asarray(target, dtype=np.float64).reshape(3).copy()
+    sim.set_camera_view(tuple(float(v) for v in _LAST_VIEWPORT_EYE), tuple(float(v) for v in _LAST_VIEWPORT_TARGET))
+
+
+def _restore_viewport(sim: sim_utils.SimulationContext):
+    if getattr(args_cli, "headless", False):
+        return
+    if _LAST_VIEWPORT_EYE is None or _LAST_VIEWPORT_TARGET is None:
+        return
+    sim.set_camera_view(
+        tuple(float(v) for v in _LAST_VIEWPORT_EYE),
+        tuple(float(v) for v in _LAST_VIEWPORT_TARGET),
+    )
+
+
+def _focus_viewport_on_mesh(sim: sim_utils.SimulationContext, mesh: trimesh.Trimesh, label: str):
+    global _VIEWPORT_FRAMED_ONCE
+    if getattr(args_cli, "headless", False):
+        return
+    if _VIEWPORT_FRAMED_ONCE and not args_cli.visualize_follow_contact:
+        return
+    bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    center = 0.5 * (bounds[0] + bounds[1])
+    extent = bounds[1] - bounds[0]
+    size = max(float(np.max(extent)), 0.04)
+    if _UR5_TACTIP_VISUALS_SPAWNED:
+        target = center + np.array([-0.18, -0.02, 0.08], dtype=np.float64)
+        eye = target + np.array([0.55, -0.90, 0.45], dtype=np.float64)
+    else:
+        view_dir = np.array([1.35, -2.1, 1.25], dtype=np.float64)
+        view_dir /= np.linalg.norm(view_dir) + 1.0e-12
+        distance = max(size * 3.2, 0.16)
+        target = center
+        eye = center + view_dir * distance
+    _focus_viewport(sim, eye, target)
+    _VIEWPORT_FRAMED_ONCE = True
+    print(
+        "[VIZ] viewport framed "
+        f"{label}: size={size:.4f}m, eye=({eye[0]:+.3f}, {eye[1]:+.3f}, {eye[2]:+.3f}), "
+        f"target=({target[0]:+.3f}, {target[1]:+.3f}, {target[2]:+.3f})",
+        flush=True,
+    )
+
+
+def _focus_viewport_on_contact(sim: sim_utils.SimulationContext, contact: np.ndarray, normal: np.ndarray):
+    if getattr(args_cli, "headless", False):
+        return
+    if not args_cli.visualize_follow_contact:
+        return
+    contact = np.asarray(contact, dtype=np.float64).reshape(3)
+    normal = np.asarray(normal, dtype=np.float64).reshape(3)
+    normal /= np.linalg.norm(normal) + 1.0e-12
+    distance = max(float(args_cli.scale) * 2.6, 0.16)
+    side_lift = np.array([0.0, -0.35 * distance, 0.25 * distance], dtype=np.float64)
+    eye = contact + normal * distance + side_lift
+    _focus_viewport(sim, eye, contact)
+
+
+def _vec3f_list(points: np.ndarray) -> list[Gf.Vec3f]:
+    return [Gf.Vec3f(float(x), float(y), float(z)) for x, y, z in np.asarray(points).reshape(-1, 3)]
+
+
+def _delete_if_valid(path: str):
+    stage = stage_utils.get_current_stage()
+    if stage.GetPrimAtPath(path).IsValid():
+        prim_utils.delete_prim(path)
+
+
+def _ensure_sampling_viz_root():
+    stage = stage_utils.get_current_stage()
+    if not stage.GetPrimAtPath("/World/SamplingViz").IsValid():
+        UsdGeom.Xform.Define(stage, "/World/SamplingViz")
+
+
+def _reset_sampling_visualization():
+    _SAMPLING_VIZ_CONTACTS.clear()
+    _delete_if_valid("/World/SamplingViz")
+    _ensure_sampling_viz_root()
+
+
+def _spawn_usd_visual(prim_path: str, usd_path: Path, translation: tuple[float, float, float]):
+    _delete_if_valid(prim_path)
+    cfg = sim_utils.UsdFileCfg(usd_path=str(usd_path))
+    cfg.func(prim_path, cfg, translation=translation, orientation=(1.0, 0.0, 0.0, 0.0))
+
+
+def _strip_visual_only_physics(root_path: str):
+    stage = stage_utils.get_current_stage()
+    physics_api_names = (
+        "RigidBodyAPI",
+        "CollisionAPI",
+        "MeshCollisionAPI",
+        "MassAPI",
+        "ArticulationRootAPI",
+    )
+    physx_api_names = (
+        "PhysxRigidBodyAPI",
+        "PhysxCollisionAPI",
+        "PhysxArticulationAPI",
+        "PhysxContactReportAPI",
+    )
+    physics_apis = [getattr(UsdPhysics, name, None) for name in physics_api_names]
+    physics_apis += [getattr(PhysxSchema, name, None) for name in physx_api_names]
+    physics_apis = [schema for schema in physics_apis if schema is not None]
+
+    removed = 0
+    deactivated = 0
+    for prim in list(stage.Traverse()):
+        prim_path = str(prim.GetPath())
+        if not prim_path.startswith(root_path):
+            continue
+        if "/collisions" in prim_path or "/joints" in prim_path:
+            if prim.IsActive():
+                prim.SetActive(False)
+                deactivated += 1
+            continue
+        for schema in physics_apis:
+            try:
+                if prim.HasAPI(schema):
+                    prim.RemoveAPI(schema)
+                    removed += 1
+            except Exception:
+                pass
+    print(
+        f"[VIZ] stripped visual-only physics under {root_path}: removed_apis={removed}, deactivated_prims={deactivated}",
+        flush=True,
+    )
+
+
+def _spawn_ur5_tactip_visuals():
+    global _UR5_TACTIP_VISUALS_SPAWNED, _UR5_TACTIP_VISUAL_ASSET, _UR5_TACTIP_ARTICULATION
+    if _UR5_TACTIP_VISUALS_SPAWNED:
+        return
+
+    try:
+        from Tactile_Lab.tactile_lab_assets.tactile_lab_assets.robots.tg3_ur5 import (
+            BITOUCH_UR5_RA_TACTIP_CFG,
+            UR5_TACTIP_CFG,
+            UR5_RA_TACTIP_CFG,
+        )
+
+        if _using_right_angle_tactip():
+            source_cfg = BITOUCH_UR5_RA_TACTIP_CFG
+            if Path(str(source_cfg.spawn.usd_path)).name.lower() != "ur5_with_right_angle_tactip.usd":
+                source_cfg = UR5_RA_TACTIP_CFG
+        else:
+            source_cfg = UR5_TACTIP_CFG
+
+        articulation_props = source_cfg.spawn.articulation_props
+        if articulation_props is not None:
+            articulation_props = articulation_props.replace(enabled_self_collisions=True)
+        robot_cfg = source_cfg.replace(
+            prim_path="/World/UR5_TacTip_Workcell",
+            spawn=source_cfg.spawn.replace(
+                articulation_props=articulation_props,
+            ),
+            init_state=source_cfg.init_state.replace(
+                joint_pos=_selected_robot_joint_positions(),
+            ),
+        )
+        _UR5_TACTIP_ARTICULATION = Articulation(robot_cfg)
+        _UR5_TACTIP_VISUAL_ASSET = str(source_cfg.spawn.usd_path)
+        print(f"[VIZ] spawned built-in UR5+TacTip articulation: {_UR5_TACTIP_VISUAL_ASSET}", flush=True)
+        joint_home = _selected_robot_joint_positions()
+        joint_home_text = ", ".join(f"{name}={value:+.5f}" for name, value in joint_home.items())
+        print(f"[VIZ] UR5 initial joint home ({_selected_robot_joint_preset_name()}): {joint_home_text}", flush=True)
+    except Exception as exc:
+        assets_root = _external_assets_root()
+        robot_usd_name = "ur5_with_right_angle_tactip.usd" if _using_right_angle_tactip() else "ur5_standard_tactip_edge.usd"
+        robot_usd = assets_root / "Robots" / "tg3_asset" / robot_usd_name
+        if not robot_usd.exists():
+            raise FileNotFoundError(f"UR5 + TacTip USD not found: {robot_usd}") from exc
+        _spawn_usd_visual("/World/UR5_TacTip_Workcell", robot_usd, translation=(0.0, 0.0, 0.0))
+        _UR5_TACTIP_VISUAL_ASSET = str(robot_usd)
+        print(
+            "[WARN] Could not spawn built-in UR5+TacTip articulation; "
+            f"used USD fallback instead. Reason: {exc}",
+            flush=True,
+        )
+        print(f"[VIZ] spawned UR5 + TacTip USD fallback: {robot_usd}", flush=True)
+
+    _UR5_TACTIP_VISUALS_SPAWNED = True
+
+
+def _initialize_ur5_tactip_controller(sim: sim_utils.SimulationContext):
+    global _UR5_TACTIP_IK_CONTROLLER
+    global _UR5_TACTIP_JOINT_IDS
+    global _UR5_TACTIP_JOINT_NAMES
+    global _UR5_TACTIP_TCP_BODY_ID
+    global _UR5_TACTIP_SENSOR_BODY_ID
+    global _UR5_TACTIP_EE_JACOBI_IDX
+    global _UR5_TACTIP_SENSOR_OFFSET_POS
+    global _UR5_TACTIP_SENSOR_OFFSET_QUAT
+    global _UR5_OBJECT_GUARD_BODY_ID_CACHE
+    if _UR5_TACTIP_ARTICULATION is None:
+        return
+
+    _refresh_ur5_tactip_articulation(sim)
+
+    tcp_body_ids, _ = _UR5_TACTIP_ARTICULATION.find_bodies("tcp_link", preserve_order=True)
+    if not tcp_body_ids:
+        raise RuntimeError("UR5+TacTip asset does not expose tcp_link.")
+    _UR5_TACTIP_TCP_BODY_ID = int(tcp_body_ids[0])
+
+    sensor_body_id = None
+    for name in ("dummy_camera", "tactip_tip_link"):
+        try:
+            body_ids, _ = _UR5_TACTIP_ARTICULATION.find_bodies(name, preserve_order=True)
+        except ValueError:
+            body_ids = []
+        if body_ids:
+            sensor_body_id = int(body_ids[0])
+            break
+    _UR5_TACTIP_SENSOR_BODY_ID = sensor_body_id
+
+    _UR5_TACTIP_JOINT_IDS, _UR5_TACTIP_JOINT_NAMES = _UR5_TACTIP_ARTICULATION.find_joints(".*", preserve_order=True)
+    _UR5_TACTIP_EE_JACOBI_IDX = (
+        _UR5_TACTIP_TCP_BODY_ID - 1 if _UR5_TACTIP_ARTICULATION.is_fixed_base else _UR5_TACTIP_TCP_BODY_ID
+    )
+    _UR5_TACTIP_IK_CONTROLLER = DifferentialIKController(
+        DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
+        num_envs=1,
+        device=sim.device,
+    )
+
+    sensor_offset_pos, sensor_offset_quat, sensor_frame_name = _selected_tcp_to_sensor_offset()
+    _UR5_TACTIP_SENSOR_OFFSET_POS = torch.tensor([sensor_offset_pos], device=sim.device, dtype=torch.float32)
+    _UR5_TACTIP_SENSOR_OFFSET_QUAT = torch.tensor([sensor_offset_quat], device=sim.device, dtype=torch.float32)
+    _UR5_TACTIP_BODY_ID_CACHE.clear()
+    for body_name in sorted({name for pair in _UR5_SELF_COLLISION_GUARDS for name in pair[:2]}):
+        try:
+            body_ids, _ = _UR5_TACTIP_ARTICULATION.find_bodies(body_name, preserve_order=True)
+        except ValueError:
+            body_ids = []
+        if body_ids:
+            _UR5_TACTIP_BODY_ID_CACHE[body_name] = int(body_ids[0])
+    _UR5_OBJECT_GUARD_BODY_ID_CACHE.clear()
+    guard_body_names = set(_UR5_OBJECT_GUARD_CHAIN)
+    for body_name in sorted(guard_body_names):
+        try:
+            body_ids, _ = _UR5_TACTIP_ARTICULATION.find_bodies(body_name, preserve_order=True)
+        except ValueError:
+            body_ids = []
+        if body_ids:
+            _UR5_OBJECT_GUARD_BODY_ID_CACHE[body_name] = int(body_ids[0])
+    print(
+        "[VIZ] initialized UR5+TacTip IK: "
+        f"tcp_link_body={_UR5_TACTIP_TCP_BODY_ID}, "
+        f"sensor_frame={sensor_frame_name}, "
+        f"asset_sensor_body={_UR5_TACTIP_SENSOR_BODY_ID}, "
+        f"object_guard_bodies={len(_UR5_OBJECT_GUARD_BODY_ID_CACHE)}, "
+        f"asset={_UR5_TACTIP_VISUAL_ASSET}",
+        flush=True,
+    )
+    _apply_ur5_named_joint_pose(sim, _selected_robot_joint_positions(), "initial home")
+
+
+def _ur5_joint_target_within_safe_margin(joint_target: torch.Tensor) -> bool:
+    if _UR5_TACTIP_ARTICULATION is None or not _UR5_TACTIP_JOINT_IDS:
+        return True
+    limits = _UR5_TACTIP_ARTICULATION.root_physx_view.get_dof_limits().to(joint_target.device)
+    if limits.ndim == 2:
+        limits = limits.unsqueeze(0)
+    selected = limits[:, _UR5_TACTIP_JOINT_IDS, :]
+    margin = max(float(args_cli.robot_joint_limit_margin), 0.0)
+    lower = selected[..., 0] + margin
+    upper = selected[..., 1] - margin
+    safe = torch.logical_and(joint_target >= lower, joint_target <= upper)
+    if bool(torch.all(safe)):
+        return True
+    print(
+        "[SAFE] rejected UR5 target outside joint safety margin "
+        f"(margin={margin:.3f} rad).",
+        flush=True,
+    )
+    return False
+
+
+def _wrap_joint_target_near_reference(joint_target: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    two_pi = torch.tensor(2.0 * np.pi, device=joint_target.device, dtype=joint_target.dtype)
+    pi = torch.tensor(np.pi, device=joint_target.device, dtype=joint_target.dtype)
+    return reference + torch.remainder(joint_target - reference + pi, two_pi) - pi
+
+
+def _joint_tensor_to_named_values(joint_pos: torch.Tensor) -> dict[str, float]:
+    if not _UR5_TACTIP_JOINT_NAMES:
+        return {}
+    flat = joint_pos.detach().cpu().reshape(-1).numpy()
+    return {
+        name: float(flat[idx])
+        for idx, name in enumerate(_UR5_TACTIP_JOINT_NAMES)
+        if idx < flat.shape[0]
+    }
+
+
+def _joint_dict_to_tensor(joint_positions: dict[str, float], device: str) -> torch.Tensor:
+    values = [float(joint_positions.get(name, 0.0)) for name in _UR5_TACTIP_JOINT_NAMES]
+    return torch.tensor([values], device=device, dtype=torch.float32)
+
+
+def _apply_ur5_named_joint_pose(sim: sim_utils.SimulationContext, joint_positions: dict[str, float], label: str):
+    if _UR5_TACTIP_ARTICULATION is None or not _UR5_TACTIP_JOINT_NAMES:
+        return
+    joint_pos = _joint_dict_to_tensor(joint_positions, sim.device)
+    joint_vel = torch.zeros_like(joint_pos)
+    _UR5_TACTIP_ARTICULATION.set_joint_position_target(joint_pos, joint_ids=_UR5_TACTIP_JOINT_IDS)
+    _UR5_TACTIP_ARTICULATION.write_joint_state_to_sim(joint_pos, joint_vel)
+    _UR5_TACTIP_ARTICULATION.write_data_to_sim()
+    for _ in range(4):
+        sim.step()
+        _refresh_ur5_tactip_articulation(sim)
+    actual = _joint_tensor_to_named_values(_UR5_TACTIP_ARTICULATION.data.joint_pos[:, _UR5_TACTIP_JOINT_IDS].clone())
+    actual_text = ", ".join(f"{name}={actual.get(name, 0.0):+.3f}" for name in _UR5_TACTIP_JOINT_NAMES)
+    print(f"[VIZ] applied UR5 {label} joint state: {actual_text}", flush=True)
+
+
+def _ur5_folded_joint_risk(joint_pos: torch.Tensor) -> tuple[bool, str]:
+    if _using_right_angle_tactip():
+        return False, ""
+    values = _joint_tensor_to_named_values(joint_pos)
+    shoulder = values.get("shoulder_joint")
+    elbow = values.get("elbow_joint")
+    wrist_1 = values.get("wrist_1_joint")
+    if shoulder is not None and shoulder > 0.80:
+        return True, f"shoulder_joint={shoulder:+.3f} rad is too folded/upright; keep it below +0.80 rad"
+    if elbow is not None and elbow > -0.05:
+        return True, f"elbow_joint={elbow:+.3f} rad is the wrong TouchSDF branch; keep the elbow folded downward/negative"
+    if elbow is not None and elbow > 2.80:
+        return True, f"elbow_joint={elbow:+.3f} rad is extremely folded; keep it below +2.80 rad"
+    if wrist_1 is not None and wrist_1 > 1.20:
+        return True, f"wrist_1_joint={wrist_1:+.3f} rad would curl the tool back toward the arm"
+    return False, ""
+
+
+def _ur5_self_collision_risk() -> tuple[bool, str]:
+    if _UR5_TACTIP_ARTICULATION is None or not _UR5_TACTIP_BODY_ID_CACHE:
+        return False, ""
+    body_pose_w = _UR5_TACTIP_ARTICULATION.data.body_pose_w
+    for body_a, body_b, min_dist in _UR5_SELF_COLLISION_GUARDS:
+        body_a_id = _UR5_TACTIP_BODY_ID_CACHE.get(body_a)
+        body_b_id = _UR5_TACTIP_BODY_ID_CACHE.get(body_b)
+        if body_a_id is None or body_b_id is None:
+            continue
+        pos_a = body_pose_w[:, body_a_id, 0:3]
+        pos_b = body_pose_w[:, body_b_id, 0:3]
+        dist = float(torch.linalg.norm(pos_a - pos_b, dim=-1).min())
+        if dist < float(min_dist):
+            return True, f"{body_a}<->{body_b} dist={dist:.4f}m < {float(min_dist):.4f}m"
+    return False, ""
+
+
+def _ur5_object_penetration_risk() -> tuple[bool, str]:
+    if (
+        args_cli.disable_robot_object_collision_guard
+        or _ACTIVE_OBJECT_BOUNDS is None
+        or _UR5_TACTIP_ARTICULATION is None
+        or not _UR5_OBJECT_GUARD_BODY_ID_CACHE
+    ):
+        return False, ""
+
+    body_pose_w = _UR5_TACTIP_ARTICULATION.data.body_pose_w
+    if body_pose_w.numel() == 0:
+        return False, ""
+
+    bounds = np.asarray(_ACTIVE_OBJECT_BOUNDS, dtype=np.float64)
+    hard_clearance = max(float(args_cli.robot_object_clearance), 0.0)
+    body_clearance = max(float(args_cli.robot_body_clearance), hard_clearance)
+
+    def _object_guard_violation(position: np.ndarray, subject: str) -> tuple[bool, str]:
+        position = np.asarray(position, dtype=np.float64).reshape(3)
+        distance = _point_distance_to_active_object_bounds(position)
+        if distance <= hard_clearance:
+            return (
+                True,
+                f"{subject} intersects hard object guard for {_ACTIVE_OBJECT_LABEL}: "
+                f"dist={distance:.3f}m <= hard_clearance={hard_clearance:.3f}m "
+                f"at ({position[0]:+.3f}, {position[1]:+.3f}, {position[2]:+.3f})",
+            )
+
+        # The larger body clearance is only a sweep-volume guard for non-tip links that pass
+        # over the object's actual XY footprint. A link that is merely beside the bounding box
+        # should not block the motion, otherwise the UR5 gets frozen at the object-top standby.
+        xy_inside_object = (
+            bounds[0, 0] <= position[0] <= bounds[1, 0]
+            and bounds[0, 1] <= position[1] <= bounds[1, 1]
+        )
+        z_in_sweep_band = bounds[0, 2] - hard_clearance <= position[2] <= bounds[1, 2] + body_clearance
+        if xy_inside_object and z_in_sweep_band:
+            return (
+                True,
+                f"{subject} crosses object XY footprint for {_ACTIVE_OBJECT_LABEL}: "
+                f"z={position[2]:+.3f}m within top+sweep={bounds[1, 2] + body_clearance:+.3f}m "
+                f"at ({position[0]:+.3f}, {position[1]:+.3f}, {position[2]:+.3f})",
+            )
+        return False, ""
+
+    body_positions: dict[str, np.ndarray] = {}
+    for body_name, body_id in _UR5_OBJECT_GUARD_BODY_ID_CACHE.items():
+        if body_name in _UR5_OBJECT_GUARD_TIP_BODIES:
+            continue
+        body_positions[body_name] = body_pose_w[0, body_id, 0:3].detach().cpu().numpy().astype(np.float64)
+
+    for body_name, position in body_positions.items():
+        violation, reason = _object_guard_violation(position, f"{body_name} origin")
+        if violation:
+            return True, reason
+
+    for body_a, body_b in zip(_UR5_OBJECT_GUARD_CHAIN[:-1], _UR5_OBJECT_GUARD_CHAIN[1:]):
+        pos_a = body_positions.get(body_a)
+        pos_b = body_positions.get(body_b)
+        if pos_a is None or pos_b is None:
+            continue
+        segment_length = float(np.linalg.norm(pos_b - pos_a))
+        sample_count = max(25, int(np.ceil(segment_length / 0.012)) + 1)
+        for alpha in np.linspace(0.0, 1.0, sample_count, dtype=np.float64):
+            sample = pos_a * (1.0 - alpha) + pos_b * alpha
+            violation, reason = _object_guard_violation(sample, f"{body_a}->{body_b} segment")
+            if violation:
+                return True, reason
+
+    return False, ""
+
+
+def _restore_safe_ur5_joint_state(sim: sim_utils.SimulationContext, joint_pos: torch.Tensor, joint_vel: torch.Tensor):
+    if _UR5_TACTIP_ARTICULATION is None:
+        return
+    safe_pos = joint_pos.clone()
+    safe_vel = joint_vel.clone()
+    _UR5_TACTIP_ARTICULATION.set_joint_position_target(safe_pos, joint_ids=_UR5_TACTIP_JOINT_IDS)
+    _UR5_TACTIP_ARTICULATION.write_joint_state_to_sim(safe_pos, safe_vel)
+    _UR5_TACTIP_ARTICULATION.write_data_to_sim()
+    _UR5_TACTIP_ARTICULATION.reset()
+    sim.step()
+    _refresh_ur5_tactip_articulation(sim)
+
+
+def _reset_ur5_to_home_pose(sim: sim_utils.SimulationContext):
+    if _UR5_TACTIP_ARTICULATION is None:
+        return
+    home_pos = _UR5_TACTIP_ARTICULATION.data.default_joint_pos[:, _UR5_TACTIP_JOINT_IDS].clone()
+    home_vel = torch.zeros_like(home_pos)
+    _UR5_TACTIP_ARTICULATION.set_joint_position_target(home_pos, joint_ids=_UR5_TACTIP_JOINT_IDS)
+    _UR5_TACTIP_ARTICULATION.write_joint_state_to_sim(home_pos, home_vel)
+    _UR5_TACTIP_ARTICULATION.write_data_to_sim()
+    _UR5_TACTIP_ARTICULATION.reset()
+    for _ in range(3):
+        sim.step()
+        _refresh_ur5_tactip_articulation(sim)
+
+
+def _hold_current_ur5_joint_state(sim: sim_utils.SimulationContext, steps: int = 2):
+    if _UR5_TACTIP_ARTICULATION is None or not _UR5_TACTIP_JOINT_IDS:
+        return
+    _refresh_ur5_tactip_articulation(sim)
+    joint_pos = _UR5_TACTIP_ARTICULATION.data.joint_pos[:, _UR5_TACTIP_JOINT_IDS].clone()
+    _UR5_TACTIP_ARTICULATION.set_joint_position_target(joint_pos, joint_ids=_UR5_TACTIP_JOINT_IDS)
+    _UR5_TACTIP_ARTICULATION.write_data_to_sim()
+    for _ in range(max(int(steps), 0)):
+        sim.step()
+        _refresh_ur5_tactip_articulation(sim)
+
+
+def _set_prim_pose(prim_path: str, position: np.ndarray, quat_wxyz: np.ndarray):
+    prim = stage_utils.get_current_stage().GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return
+    position = np.asarray(position, dtype=np.float64).reshape(3)
+    quat_wxyz = np.asarray(quat_wxyz, dtype=np.float64).reshape(4)
+    xformable = UsdGeom.Xformable(prim)
+    xformable.ClearXformOpOrder()
+    xformable.AddTranslateOp().Set(Gf.Vec3d(float(position[0]), float(position[1]), float(position[2])))
+    xformable.AddOrientOp().Set(
+        Gf.Quatf(
+            float(quat_wxyz[0]),
+            Gf.Vec3f(float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3])),
+        )
+    )
+
+
+def _set_local_translate(prim, translation: tuple[float, float, float]):
+    xformable = UsdGeom.Xformable(prim.GetPrim())
+    xformable.ClearXformOpOrder()
+    xformable.AddTranslateOp().Set(Gf.Vec3d(float(translation[0]), float(translation[1]), float(translation[2])))
+
+
+def _command_ur5_tcp_pose(
+    sim: sim_utils.SimulationContext,
+    tcp_pos_w: np.ndarray,
+    tcp_quat_wxyz: np.ndarray,
+    max_iters: int = 6,
+    pos_tol: float = 0.006,
+    rot_tol_rad: float = 0.18,
+):
+    if (
+        _UR5_TACTIP_ARTICULATION is None
+        or _UR5_TACTIP_IK_CONTROLLER is None
+        or _UR5_TACTIP_SENSOR_OFFSET_POS is None
+        or _UR5_TACTIP_SENSOR_OFFSET_QUAT is None
+        or _UR5_TACTIP_TCP_BODY_ID is None
+        or _UR5_TACTIP_EE_JACOBI_IDX is None
+    ):
+        return False
+
+    desired_tcp_pos_w, desired_tcp_quat_w = _torch_pose_from_numpy(tcp_pos_w, tcp_quat_wxyz, sim.device)
+
+    def _blocking_joint_move(targ_j_pos: torch.Tensor, constant_vel: float | None) -> bool:
+        if not _ur5_joint_target_within_safe_margin(targ_j_pos):
+            return False
+        risk, reason = _ur5_folded_joint_risk(targ_j_pos)
+        if risk:
+            print(f"[SAFE] rejected UR5 folded IK target: {reason}", flush=True)
+            return False
+        move_constant_vel = None if constant_vel is None else float(constant_vel)
+        max_steps = 240
+        j_pos_tol = 0.01
+        j_vel_tol = 0.12
+        for _ in range(max_steps):
+            _refresh_ur5_tactip_articulation(sim)
+            cur_j_pos = _UR5_TACTIP_ARTICULATION.data.joint_pos[:, _UR5_TACTIP_JOINT_IDS].clone()
+            cur_j_vel = _UR5_TACTIP_ARTICULATION.data.joint_vel[:, _UR5_TACTIP_JOINT_IDS].clone()
+            prev_safe_pos = cur_j_pos.clone()
+            prev_safe_vel = cur_j_vel.clone()
+
+            if move_constant_vel is not None and move_constant_vel > 0.0:
+                diff_j = targ_j_pos - cur_j_pos
+                norm = torch.linalg.norm(diff_j, dim=-1, keepdim=True)
+                direction = torch.where(
+                    norm > 0.0,
+                    diff_j / (norm + 1.0e-8),
+                    torch.zeros_like(diff_j),
+                )
+                step_j = cur_j_pos + direction * move_constant_vel
+                if torch.all(torch.abs(diff_j) < move_constant_vel):
+                    move_constant_vel *= 0.5
+            else:
+                step_j = targ_j_pos
+
+            if not _ur5_joint_target_within_safe_margin(step_j):
+                return False
+            risk, reason = _ur5_folded_joint_risk(step_j)
+            if risk:
+                _restore_safe_ur5_joint_state(sim, prev_safe_pos, prev_safe_vel)
+                print(f"[SAFE] rejected UR5 folded intermediate target: {reason}", flush=True)
+                return False
+            _UR5_TACTIP_ARTICULATION.set_joint_position_target(step_j, joint_ids=_UR5_TACTIP_JOINT_IDS)
+            _UR5_TACTIP_ARTICULATION.write_data_to_sim()
+            sim.step()
+            _refresh_ur5_tactip_articulation(sim)
+            sim.step()
+            _refresh_ur5_tactip_articulation(sim)
+            risk, reason = _ur5_self_collision_risk()
+            if risk:
+                _restore_safe_ur5_joint_state(sim, prev_safe_pos, prev_safe_vel)
+                print(f"[SAFE] rejected UR5 self-intersection risk: {reason}", flush=True)
+                return False
+            risk, reason = _ur5_object_penetration_risk()
+            if risk:
+                _restore_safe_ur5_joint_state(sim, prev_safe_pos, prev_safe_vel)
+                print(f"[SAFE] rejected UR5/object penetration risk: {reason}", flush=True)
+                return False
+
+            new_j_pos = _UR5_TACTIP_ARTICULATION.data.joint_pos[:, _UR5_TACTIP_JOINT_IDS].clone()
+            new_j_vel = _UR5_TACTIP_ARTICULATION.data.joint_vel[:, _UR5_TACTIP_JOINT_IDS].clone()
+            j_pos_err = torch.sum(torch.abs(targ_j_pos - new_j_pos))
+            j_vel_err = torch.sum(torch.abs(new_j_vel))
+            if float(j_pos_err) < j_pos_tol and float(j_vel_err) < j_vel_tol:
+                break
+        return True
+
+    for _ in range(max(int(max_iters), 1)):
+        _refresh_ur5_tactip_articulation(sim)
+        root_pose_w = _UR5_TACTIP_ARTICULATION.data.root_pose_w.clone()
+        tcp_pose_w = _UR5_TACTIP_ARTICULATION.data.body_pose_w[:, _UR5_TACTIP_TCP_BODY_ID].clone()
+        joint_pos = _UR5_TACTIP_ARTICULATION.data.joint_pos[:, _UR5_TACTIP_JOINT_IDS].clone()
+        jacobian = _UR5_TACTIP_ARTICULATION.root_physx_view.get_jacobians()[
+            :, _UR5_TACTIP_EE_JACOBI_IDX, :, _UR5_TACTIP_JOINT_IDS
+        ]
+
+        cur_tcp_pos_b, cur_tcp_quat_b = subtract_frame_transforms(
+            root_pose_w[:, 0:3], root_pose_w[:, 3:7], tcp_pose_w[:, 0:3], tcp_pose_w[:, 3:7]
+        )
+        des_tcp_pos_b, des_tcp_quat_b = subtract_frame_transforms(
+            root_pose_w[:, 0:3], root_pose_w[:, 3:7], desired_tcp_pos_w, desired_tcp_quat_w
+        )
+        tcp_command_b = torch.cat([des_tcp_pos_b, des_tcp_quat_b], dim=-1)
+        _UR5_TACTIP_IK_CONTROLLER.set_command(tcp_command_b)
+        joint_pos_des = _UR5_TACTIP_IK_CONTROLLER.compute(cur_tcp_pos_b, cur_tcp_quat_b, jacobian, joint_pos)
+        joint_pos_des = _wrap_joint_target_near_reference(joint_pos_des, joint_pos)
+        constant_vel = max(float(args_cli.robot_joint_step_size), 0.0)
+        if not _blocking_joint_move(joint_pos_des, constant_vel if constant_vel > 0.0 else None):
+            return False
+
+        tcp_pose_w = _UR5_TACTIP_ARTICULATION.data.body_pose_w[:, _UR5_TACTIP_TCP_BODY_ID].clone()
+        pos_err, rot_err = compute_pose_error(
+            tcp_pose_w[:, 0:3], tcp_pose_w[:, 3:7], desired_tcp_pos_w, desired_tcp_quat_w, rot_error_type="axis_angle"
+        )
+        joint_vel = _UR5_TACTIP_ARTICULATION.data.joint_vel[:, _UR5_TACTIP_JOINT_IDS].clone()
+        if (
+            float(torch.linalg.norm(pos_err, dim=-1).max()) <= pos_tol
+            and float(torch.linalg.norm(rot_err, dim=-1).max()) <= rot_tol_rad
+            and float(torch.sum(torch.abs(joint_vel), dim=-1).max()) <= 0.35
+        ):
+            return True
+    return False
+
+
+def _command_ur5_tactip_to_sensor_pose(
+    sim: sim_utils.SimulationContext,
+    sensor_pos_w: np.ndarray,
+    sensor_quat_wxyz: np.ndarray,
+    max_iters: int = 6,
+    pos_tol: float = 0.006,
+    rot_tol_rad: float = 0.18,
+):
+    if _UR5_TACTIP_SENSOR_OFFSET_POS is None or _UR5_TACTIP_SENSOR_OFFSET_QUAT is None:
+        return False
+    sensor_pos_w_t, sensor_quat_w_t = _torch_pose_from_numpy(sensor_pos_w, sensor_quat_wxyz, sim.device)
+    sensor_to_tcp_pos, sensor_to_tcp_quat = subtract_frame_transforms(
+        _UR5_TACTIP_SENSOR_OFFSET_POS, _UR5_TACTIP_SENSOR_OFFSET_QUAT
+    )
+    desired_tcp_pos_w, desired_tcp_quat_w = combine_frame_transforms(
+        sensor_pos_w_t, sensor_quat_w_t, sensor_to_tcp_pos, sensor_to_tcp_quat
+    )
+    return _command_ur5_tcp_pose(
+        sim,
+        desired_tcp_pos_w[0].detach().cpu().numpy(),
+        desired_tcp_quat_w[0].detach().cpu().numpy(),
+        max_iters=max_iters,
+        pos_tol=pos_tol,
+        rot_tol_rad=rot_tol_rad,
+    )
+
+
+def _spawn_or_update_tactip_probe(contact: np.ndarray, normal: np.ndarray, eye: np.ndarray):
+    return
+
+
+def _update_active_tactip_visual(sim: sim_utils.SimulationContext, contact: np.ndarray, normal: np.ndarray, eye: np.ndarray):
+    if not _UR5_TACTIP_VISUALS_SPAWNED:
+        return
+    _command_ur5_tactip_to_sensor_pose(
+        sim,
+        sensor_pos_w=np.asarray(eye, dtype=np.float32),
+        sensor_quat_wxyz=_quat_wxyz_from_contact_normal(contact, normal),
+    )
+
+
+def _draw_points(path: str, points: np.ndarray, color: tuple[float, float, float], width: float):
+    _delete_if_valid(path)
+    if points.size == 0:
+        return
+    points_prim = UsdGeom.Points.Define(stage_utils.get_current_stage(), path)
+    points_prim.CreatePointsAttr(_vec3f_list(points))
+    points_prim.CreateWidthsAttr([float(width)] * int(points.shape[0]))
+    points_prim.CreateDisplayColorAttr([Gf.Vec3f(*color)])
+
+
+def _draw_curve(path: str, points: np.ndarray, color: tuple[float, float, float], width: float):
+    _delete_if_valid(path)
+    curve = UsdGeom.BasisCurves.Define(stage_utils.get_current_stage(), path)
+    curve.CreateTypeAttr("linear")
+    curve.CreateWrapAttr("nonperiodic")
+    curve.CreateCurveVertexCountsAttr([int(points.shape[0])])
+    curve.CreatePointsAttr(_vec3f_list(points))
+    curve.CreateWidthsAttr([float(width)] * int(points.shape[0]))
+    curve.CreateDisplayColorAttr([Gf.Vec3f(*color)])
+
+
+def _estimate_touch_eye(contact: np.ndarray, normal: np.ndarray, reference_depth: np.ndarray) -> np.ndarray:
+    reference_center_depth = float(reference_depth[reference_depth.shape[0] // 2, reference_depth.shape[1] // 2])
+    if args_cli.tactile_mode == "tactip_deformation":
+        camera_distance = max(
+            reference_center_depth - args_cli.indentation_depth,
+            args_cli.near_plane * 2.0,
+        )
+    else:
+        camera_distance = args_cli.camera_distance
+    return np.asarray(contact, dtype=np.float64) + np.asarray(normal, dtype=np.float64) * camera_distance
+
+
+def _estimate_pre_contact_eye(contact: np.ndarray, normal: np.ndarray, reference_depth: np.ndarray) -> np.ndarray:
+    touch_eye = _estimate_touch_eye(contact, normal, reference_depth)
+    stand_off = max(float(args_cli.surface_clearance), 0.0) + max(float(args_cli.robot_approach_offset), 0.0)
+    return touch_eye + np.asarray(normal, dtype=np.float64) * stand_off
+
+
+def _estimate_ellipsoid_staging_eye(contact: np.ndarray, normal: np.ndarray, reference_depth: np.ndarray) -> np.ndarray:
+    center, extent, _ = _active_object_center_extent_top()
+    normal = np.asarray(normal, dtype=np.float64).reshape(3)
+    normal /= np.linalg.norm(normal) + 1.0e-12
+    pre_contact_eye = _estimate_pre_contact_eye(contact, normal, reference_depth)
+    reference_center_depth = float(reference_depth[reference_depth.shape[0] // 2, reference_depth.shape[1] // 2])
+    half_extent = 0.5 * np.maximum(np.asarray(extent, dtype=np.float64), 0.02)
+    shell_clearance = max(
+        float(args_cli.robot_ellipsoid_clearance),
+        float(args_cli.robot_body_clearance),
+        float(args_cli.robot_lateral_clearance) * 0.35,
+        0.02,
+    )
+    axes = np.maximum(half_extent + shell_clearance + reference_center_depth, 0.03)
+    ray_scale = 1.0 / np.sqrt(np.sum((normal / axes) ** 2) + 1.0e-12)
+    shell_eye = center + normal * ray_scale
+
+    pre_radial = float(np.dot(pre_contact_eye - center, normal))
+    shell_radial = float(np.dot(shell_eye - center, normal))
+    min_shell_gap = max(float(args_cli.robot_approach_offset), 0.05)
+    if shell_radial < pre_radial + min_shell_gap:
+        shell_eye = pre_contact_eye + normal * min_shell_gap
+
+    # Keep the staging pose above the object's vertical envelope unless the contact is deliberately lateral.
+    min_stage_z = float(center[2] - half_extent[2] + 0.04)
+    shell_eye[2] = max(float(shell_eye[2]), min_stage_z)
+    return shell_eye.astype(np.float64)
+
+
+def _estimate_overhead_eye(contact: np.ndarray, reference_depth: np.ndarray) -> np.ndarray:
+    contact = np.asarray(contact, dtype=np.float64).reshape(3)
+    reference_center_depth = float(reference_depth[reference_depth.shape[0] // 2, reference_depth.shape[1] // 2])
+    min_clearance = max(float(args_cli.standby_hover_gap) + reference_center_depth, 0.12)
+    if _STANDBY_SENSOR_POS_W is not None:
+        overhead_z = max(float(_STANDBY_SENSOR_POS_W[2]), float(contact[2]) + min_clearance)
+    else:
+        overhead_z = float(contact[2]) + min_clearance
+    return np.array([float(contact[0]), float(contact[1]), overhead_z], dtype=np.float64)
+
+
+def _tactile_from_depth(depth: np.ndarray, reference_depth: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None, float]:
+    valid = np.isfinite(depth)
+    if not valid.any():
+        return None, None, 0.0
+
+    reference_center_depth = float(reference_depth[reference_depth.shape[0] // 2, reference_depth.shape[1] // 2])
+    if args_cli.tactile_mode == "tactip_deformation":
+        valid &= depth < (args_cli.far_plane * 0.995)
+        current_depth = reference_depth.copy()
+        current_depth[valid] = np.minimum(reference_depth[valid], depth[valid])
+        deformation_depth = np.clip(np.abs(current_depth - reference_depth), 0.0, args_cli.max_deformation_depth)
+        deformation = deformation_depth * args_cli.deformation_scale
+        tactile = np.clip(deformation, 0.0, 1.0)
+        center_depth = float(current_depth[current_depth.shape[0] // 2, current_depth.shape[1] // 2])
+        center_deformation = float(np.clip(reference_center_depth - center_depth, 0.0, args_cli.max_deformation_depth))
+    else:
+        current_depth = depth.copy()
+        far = args_cli.camera_distance + args_cli.depth_span
+        tactile = np.clip((far - depth) / max(args_cli.depth_span, 1.0e-6), 0.0, 1.0)
+        center_deformation = 0.0
+
+    tactile[~valid] = 0.0
+    if float(tactile.max()) <= 0.0:
+        return None, None, center_deformation
+    return tactile.astype(np.float32), current_depth.astype(np.float32), center_deformation
+
+
+def _set_object_standby_pose(mesh: trimesh.Trimesh, reference_depth: np.ndarray, label: str):
+    global _STANDBY_SENSOR_POS_W, _STANDBY_SENSOR_QUAT_WXYZ
+    global _STANDBY_TCP_POS_W, _STANDBY_TCP_QUAT_WXYZ
+    global _STANDBY_LABEL
+    bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    bbox_center = np.array(
+        [
+            0.5 * (bounds[0, 0] + bounds[1, 0]),
+            0.5 * (bounds[0, 1] + bounds[1, 1]),
+            0.5 * (bounds[0, 2] + bounds[1, 2]),
+        ],
+        dtype=np.float64,
+    )
+    reference_center_depth = float(reference_depth[reference_depth.shape[0] // 2, reference_depth.shape[1] // 2])
+    sensor_hover = max(
+        float(args_cli.robot_initial_hover_height),
+        float(args_cli.standby_hover_gap) + reference_center_depth,
+        0.08,
+    )
+    standby_sensor_pos = np.array(
+        [
+            bbox_center[0],
+            bbox_center[1],
+            bounds[1, 2] + sensor_hover,
+        ],
+        dtype=np.float64,
+    )
+    standby_sensor_quat = _quat_wxyz_for_world_down(bbox_center).astype(np.float32)
+    standby_tcp_pos, standby_tcp_quat = _tcp_pose_from_sensor_pose(standby_sensor_pos, standby_sensor_quat)
+    standby_sensor_pos, standby_sensor_quat = _sensor_pose_from_tcp_pose(standby_tcp_pos, standby_tcp_quat)
+    _STANDBY_TCP_POS_W = standby_tcp_pos.astype(np.float32)
+    _STANDBY_TCP_QUAT_WXYZ = standby_tcp_quat.astype(np.float32)
+    _STANDBY_SENSOR_POS_W = standby_sensor_pos.astype(np.float32)
+    _STANDBY_SENSOR_QUAT_WXYZ = standby_sensor_quat.astype(np.float32)
+    _STANDBY_LABEL = label
+    print(
+        "[VIZ] standby pose "
+        f"{label}: tcp=({_STANDBY_TCP_POS_W[0]:+.3f}, {_STANDBY_TCP_POS_W[1]:+.3f}, {_STANDBY_TCP_POS_W[2]:+.3f}) "
+        f"sensor=({_STANDBY_SENSOR_POS_W[0]:+.3f}, {_STANDBY_SENSOR_POS_W[1]:+.3f}, {_STANDBY_SENSOR_POS_W[2]:+.3f}) "
+        f"object_center=({bbox_center[0]:+.3f}, {bbox_center[1]:+.3f}, {bbox_center[2]:+.3f}) "
+        f"object_top_z={bounds[1, 2]:+.3f} sensor_hover={sensor_hover:.3f}m",
+        flush=True,
+    )
+
+
+def _active_object_center_extent_top() -> tuple[np.ndarray, np.ndarray, float]:
+    if _ACTIVE_OBJECT_BOUNDS is None:
+        center = np.array([args_cli.object_world_x, args_cli.object_world_y, args_cli.object_world_z], dtype=np.float64)
+        extent = np.array([max(float(args_cli.scale), 0.05)] * 3, dtype=np.float64)
+        top_z = float(center[2] + 0.5 * extent[2])
+        return center, extent, top_z
+    bounds = np.asarray(_ACTIVE_OBJECT_BOUNDS, dtype=np.float64)
+    center = 0.5 * (bounds[0] + bounds[1])
+    extent = np.maximum(bounds[1] - bounds[0], 0.02)
+    top_z = float(bounds[1, 2])
+    return center, extent, top_z
+
+
+def _planner_transit_z(target_pos: np.ndarray) -> float:
+    _, _, object_top_z = _active_object_center_extent_top()
+    target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3)
+    return max(
+        object_top_z + max(float(args_cli.robot_transit_height), 0.0),
+        float(target_pos[2]) + 0.10,
+        float(_STANDBY_TCP_POS_W[2]) + 0.08 if _STANDBY_TCP_POS_W is not None else float(target_pos[2]) + 0.10,
+    )
+
+
+def _planner_side_waypoints(target_pos: np.ndarray, transit_z: float) -> list[np.ndarray]:
+    center, extent, _ = _active_object_center_extent_top()
+    target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3)
+    lateral = max(float(args_cli.robot_lateral_clearance), 0.0)
+    x_offset = 0.5 * float(extent[0]) + lateral
+    y_offset = 0.5 * float(extent[1]) + lateral
+    base_dirs = (
+        np.array([-x_offset, 0.0, 0.0], dtype=np.float64),
+        np.array([0.0, -y_offset, 0.0], dtype=np.float64),
+        np.array([0.0, +y_offset, 0.0], dtype=np.float64),
+        np.array([+x_offset, 0.0, 0.0], dtype=np.float64),
+        np.array([-x_offset, -y_offset, 0.0], dtype=np.float64),
+        np.array([-x_offset, +y_offset, 0.0], dtype=np.float64),
+        np.array([+x_offset, -y_offset, 0.0], dtype=np.float64),
+        np.array([+x_offset, +y_offset, 0.0], dtype=np.float64),
+    )
+    waypoints = [np.array([center[0] + d[0], center[1] + d[1], transit_z], dtype=np.float64) for d in base_dirs]
+    current_pos = target_pos
+    if _UR5_TACTIP_ARTICULATION is not None and _UR5_TACTIP_TCP_BODY_ID is not None:
+        try:
+            current_pos = (
+                _UR5_TACTIP_ARTICULATION.data.body_pose_w[0, _UR5_TACTIP_TCP_BODY_ID, 0:3]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+        except Exception:
+            current_pos = target_pos
+    waypoints.sort(key=lambda p: float(np.linalg.norm(p[:2] - current_pos[:2])))
+    return waypoints
+
+
+def _planner_position_routes(target_pos: np.ndarray) -> list[list[np.ndarray]]:
+    target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3)
+    transit_z = _planner_transit_z(target_pos)
+    high_target = np.array([target_pos[0], target_pos[1], transit_z], dtype=np.float64)
+    side_waypoints = _planner_side_waypoints(target_pos, transit_z)
+    routes: list[list[np.ndarray]] = [[target_pos]]
+    routes.append([high_target, target_pos])
+    for side in side_waypoints:
+        routes.append([side, high_target, target_pos])
+    return routes
+
+
+def _command_ur5_tcp_route(
+    sim: sim_utils.SimulationContext,
+    positions: list[np.ndarray],
+    quat_wxyz: np.ndarray,
+    label: str,
+    pos_tol: float,
+    rot_tol_rad: float,
+) -> bool:
+    for waypoint_idx, waypoint in enumerate(positions):
+        waypoint = np.asarray(waypoint, dtype=np.float64).reshape(3)
+        ok = _command_ur5_tcp_pose(
+            sim,
+            waypoint,
+            quat_wxyz,
+            max_iters=24,
+            pos_tol=pos_tol if waypoint_idx == len(positions) - 1 else max(pos_tol, 0.014),
+            rot_tol_rad=rot_tol_rad if waypoint_idx == len(positions) - 1 else max(rot_tol_rad, 0.70),
+        )
+        if not ok:
+            print(
+                "[PLAN] TCP route failed "
+                f"{label}: waypoint={waypoint_idx + 1}/{len(positions)} "
+                f"target=({waypoint[0]:+.3f}, {waypoint[1]:+.3f}, {waypoint[2]:+.3f})",
+                flush=True,
+            )
+            return False
+    return True
+
+
+def _plan_and_command_ur5_tcp_pose(
+    sim: sim_utils.SimulationContext,
+    target_pos_w: np.ndarray,
+    target_quat_wxyz: np.ndarray,
+    label: str,
+    pos_tol: float = 0.010,
+    rot_tol_rad: float = 0.60,
+) -> bool:
+    routes = _planner_position_routes(target_pos_w)
+    for route_idx, route in enumerate(routes):
+        print(
+            "[PLAN] trying TCP route "
+            f"{label}: route={route_idx + 1}/{len(routes)} waypoints={len(route)}",
+            flush=True,
+        )
+        if _command_ur5_tcp_route(sim, route, target_quat_wxyz, label, pos_tol, rot_tol_rad):
+            return True
+    return False
+
+
+def _command_ur5_sensor_route(
+    sim: sim_utils.SimulationContext,
+    positions: list[np.ndarray],
+    quat_wxyz: np.ndarray,
+    label: str,
+    pos_tol: float,
+    rot_tol_rad: float,
+) -> bool:
+    for waypoint_idx, waypoint in enumerate(positions):
+        waypoint = np.asarray(waypoint, dtype=np.float64).reshape(3)
+        ok = _command_ur5_tactip_to_sensor_pose(
+            sim,
+            waypoint,
+            quat_wxyz,
+            max_iters=24,
+            pos_tol=pos_tol if waypoint_idx == len(positions) - 1 else max(pos_tol, 0.014),
+            rot_tol_rad=rot_tol_rad if waypoint_idx == len(positions) - 1 else max(rot_tol_rad, 0.70),
+        )
+        if not ok:
+            print(
+                "[PLAN] sensor route failed "
+                f"{label}: waypoint={waypoint_idx + 1}/{len(positions)} "
+                f"target=({waypoint[0]:+.3f}, {waypoint[1]:+.3f}, {waypoint[2]:+.3f})",
+                flush=True,
+            )
+            return False
+    return True
+
+
+def _plan_and_command_ur5_sensor_pose(
+    sim: sim_utils.SimulationContext,
+    target_pos_w: np.ndarray,
+    target_quat_wxyz: np.ndarray,
+    label: str,
+    pos_tol: float = 0.010,
+    rot_tol_rad: float = 0.28,
+) -> bool:
+    routes = _planner_position_routes(target_pos_w)
+    for route_idx, route in enumerate(routes):
+        print(
+            "[PLAN] trying sensor route "
+            f"{label}: route={route_idx + 1}/{len(routes)} waypoints={len(route)}",
+            flush=True,
+        )
+        if _command_ur5_sensor_route(sim, route, target_quat_wxyz, label, pos_tol, rot_tol_rad):
+            return True
+    return False
+
+
+def _command_ur5_sensor_line(
+    sim: sim_utils.SimulationContext,
+    start_pos_w: np.ndarray,
+    end_pos_w: np.ndarray,
+    target_quat_wxyz: np.ndarray,
+    label: str,
+    steps: int,
+    pos_tol: float = 0.010,
+    rot_tol_rad: float = 0.28,
+) -> bool:
+    start_pos_w = np.asarray(start_pos_w, dtype=np.float64).reshape(3)
+    end_pos_w = np.asarray(end_pos_w, dtype=np.float64).reshape(3)
+    for idx, alpha in enumerate(np.linspace(0.0, 1.0, max(int(steps), 2), dtype=np.float32)):
+        target = start_pos_w + float(alpha) * (end_pos_w - start_pos_w)
+        if not _command_ur5_tactip_to_sensor_pose(
+            sim,
+            target,
+            target_quat_wxyz,
+            max_iters=20,
+            pos_tol=pos_tol,
+            rot_tol_rad=rot_tol_rad,
+        ):
+            print(
+                "[PLAN] sensor line failed "
+                f"{label}: waypoint={idx + 1}/{max(int(steps), 2)} "
+                f"target=({target[0]:+.3f}, {target[1]:+.3f}, {target[2]:+.3f})",
+                flush=True,
+            )
+            return False
+    return True
+
+
+def _command_ur5_tcp_line(
+    sim: sim_utils.SimulationContext,
+    start_pos_w: np.ndarray,
+    end_pos_w: np.ndarray,
+    target_quat_wxyz: np.ndarray,
+    label: str,
+    steps: int,
+    pos_tol: float = 0.010,
+    rot_tol_rad: float = 0.35,
+) -> bool:
+    start_pos_w = np.asarray(start_pos_w, dtype=np.float64).reshape(3)
+    end_pos_w = np.asarray(end_pos_w, dtype=np.float64).reshape(3)
+    total_steps = max(int(steps), 2)
+    for idx, alpha in enumerate(np.linspace(0.0, 1.0, total_steps, dtype=np.float32)):
+        target = start_pos_w + float(alpha) * (end_pos_w - start_pos_w)
+        if not _command_ur5_tcp_pose(
+            sim,
+            target,
+            target_quat_wxyz,
+            max_iters=20,
+            pos_tol=pos_tol,
+            rot_tol_rad=rot_tol_rad,
+        ):
+            print(
+                "[PLAN] TouchSDF TCP line failed "
+                f"{label}: waypoint={idx + 1}/{total_steps} "
+                f"target=({target[0]:+.3f}, {target[1]:+.3f}, {target[2]:+.3f})",
+                flush=True,
+            )
+            return False
+    return True
+
+
+def _move_ur5_touchsdf_high_and_sphere(
+    sim: sim_utils.SimulationContext,
+    object_center: np.ndarray,
+    sphere_pos: np.ndarray,
+    sphere_angles: np.ndarray,
+    label: str,
+) -> tuple[bool, np.ndarray]:
+    object_center = np.asarray(object_center, dtype=np.float64).reshape(3)
+    sphere_pos = np.asarray(sphere_pos, dtype=np.float64).reshape(3)
+    high_pos = object_center + np.array([0.0, 0.0, _TOUCHSDF_HIGH_OFFSET_WRLD], dtype=np.float64)
+    high_tcp_quat = _touchsdf_default_tcp_quat_wxyz()
+    sphere_tcp_quat = _touchsdf_sphere_quat_wxyz(sphere_angles)
+    if _UR5_TACTIP_ARTICULATION is not None:
+        _apply_ur5_named_joint_pose(sim, _selected_robot_joint_positions(), f"{label} TouchSDF rest seed")
+        _hold_current_ur5_joint_state(sim, steps=2)
+    print(
+        "[PLAN] TouchSDF TCP route "
+        f"{label}: current/rest -> object_center+[0,0,0.2] -> sphere -> inward touch",
+        flush=True,
+    )
+    if not _command_ur5_tcp_route(
+        sim,
+        [high_pos],
+        high_tcp_quat,
+        f"{label}_high",
+        pos_tol=0.018,
+        rot_tol_rad=0.65,
+    ):
+        print(f"[SAFE] skipped {label}: TouchSDF high pose was unsafe.", flush=True)
+        return False, sphere_tcp_quat
+    if not _command_ur5_tcp_route(
+        sim,
+        [sphere_pos],
+        sphere_tcp_quat,
+        f"{label}_sphere",
+        pos_tol=0.018,
+        rot_tol_rad=0.65,
+    ):
+        print(f"[SAFE] skipped {label}: TouchSDF sphere pose was unsafe.", flush=True)
+        return False, sphere_tcp_quat
+    return True, sphere_tcp_quat
+
+
+def _initialize_ur5_at_object_top_standby(sim: sim_utils.SimulationContext) -> bool:
+    if _UR5_TACTIP_ARTICULATION is None or _UR5_TACTIP_TCP_BODY_ID is None:
+        return False
+    _clear_active_object_collision_guard()
+    _apply_ur5_named_joint_pose(sim, _selected_robot_joint_positions(), "TouchSDF rest")
+    _hold_current_ur5_joint_state(sim, steps=4)
+    joint_state = _joint_tensor_to_named_values(
+        _UR5_TACTIP_ARTICULATION.data.joint_pos[:, _UR5_TACTIP_JOINT_IDS].clone()
+    )
+    joint_state_text = ", ".join(
+        f"{name}={joint_state.get(name, 0.0):+.3f}" for name in _UR5_TACTIP_JOINT_NAMES
+    )
+    print(
+        "[VIZ] initialized UR5 exactly at TouchSDF/tactile_gym rest joint seed: "
+        f"{joint_state_text}",
+        flush=True,
+    )
+    return True
+
+
+def _draw_sampling_candidates(contacts: np.ndarray):
+    if not args_cli.visualize_point_markers:
+        _delete_if_valid("/World/SamplingViz/planned_contacts")
+        return
+    marker_scale = max(float(args_cli.visualize_marker_scale), 1.0e-5)
+    _draw_points(
+        "/World/SamplingViz/planned_contacts",
+        np.asarray(contacts, dtype=np.float32),
+        (0.55, 0.55, 0.55),
+        marker_scale * 0.8,
+    )
+
+
+def _preview_sampling_candidate(
+    sim: sim_utils.SimulationContext,
+    candidate_idx: int,
+    contact: np.ndarray,
+    normal: np.ndarray,
+    reference_depth: np.ndarray,
+    object_center: np.ndarray | None = None,
+    sphere_pos: np.ndarray | None = None,
+    sphere_angles: np.ndarray | None = None,
+    pause_seconds: float | None = None,
+):
+    _ensure_sampling_viz_root()
+    marker_scale = max(float(args_cli.visualize_marker_scale), 1.0e-5)
+    contact = np.asarray(contact, dtype=np.float32).reshape(3)
+    normal = np.asarray(normal, dtype=np.float32).reshape(3)
+    normal /= np.linalg.norm(normal) + 1.0e-12
+    touch_eye = _estimate_touch_eye(contact, normal, reference_depth).astype(np.float32)
+    if args_cli.visualize_direction_lines:
+        if sphere_pos is not None:
+            line_start = np.asarray(sphere_pos, dtype=np.float32).reshape(3)
+        else:
+            line_start = _estimate_pre_contact_eye(contact, normal, reference_depth).astype(np.float32)
+        press_line = np.stack([line_start, touch_eye, contact, contact - normal * marker_scale * 6.0], axis=0)
+        _draw_curve("/World/SamplingViz/candidate_press_direction", press_line, (0.75, 0.15, 1.0), marker_scale * 0.5)
+    else:
+        _delete_if_valid("/World/SamplingViz/current_candidate")
+        _delete_if_valid("/World/SamplingViz/candidate_press_direction")
+    if args_cli.spawn_ur5_tactip and _UR5_TACTIP_ARTICULATION is not None:
+        if object_center is None or sphere_pos is None or sphere_angles is None:
+            object_center = contact - normal * max(float(args_cli.scale), 0.05)
+            sphere_pos = _estimate_pre_contact_eye(contact, normal, reference_depth)
+            sphere_angles = np.array([0.0, np.pi * 0.5], dtype=np.float32)
+        touch_tcp_pos, _ = _tcp_pose_from_sensor_pose(touch_eye, _touchsdf_sphere_quat_wxyz(sphere_angles))
+        _hold_current_ur5_joint_state(sim)
+        ok, tcp_quat_wxyz = _move_ur5_touchsdf_high_and_sphere(
+            sim,
+            object_center,
+            sphere_pos,
+            sphere_angles,
+            f"preview_{candidate_idx:03d}",
+        )
+        if not ok:
+            return
+        if not _command_ur5_tcp_line(
+            sim,
+            sphere_pos,
+            touch_tcp_pos,
+            tcp_quat_wxyz,
+            f"preview_inward_{candidate_idx:03d}",
+            steps=max(int(args_cli.robot_approach_steps) * 3, 8),
+            pos_tol=0.010,
+            rot_tol_rad=0.45,
+        ):
+            print(f"[SAFE] skipped preview candidate {candidate_idx:03d}: TouchSDF inward path unsafe.", flush=True)
+            return
+    else:
+        _update_active_tactip_visual(sim, contact, normal, touch_eye)
+    _focus_viewport_on_contact(sim, contact, normal)
+    print(f"[VIZ] candidate {candidate_idx:03d}: previewing TacTip pose before depth render", flush=True)
+
+    if pause_seconds is None:
+        pause_seconds = min(0.20, args_cli.visualize_sampling_pause * 0.25)
+    if pause_seconds > 0.0:
+        _pump_gui(sim, pause_seconds, min_steps=2)
+    else:
+        _pump_gui(sim, 0.0, min_steps=2)
+    _hold_current_ur5_joint_state(sim)
+
+
+def _play_sampling_prepass(
+    sim: sim_utils.SimulationContext,
+    contacts: np.ndarray,
+    normals: np.ndarray,
+    reference_depth: np.ndarray,
+    object_center: np.ndarray | None = None,
+    sphere_positions: np.ndarray | None = None,
+    sphere_angles: np.ndarray | None = None,
+):
+    if not args_cli.visualize_sampling:
+        return
+    n_preview = min(max(int(args_cli.visualize_prepass_contacts), 0), len(contacts))
+    if n_preview == 0:
+        return
+    print(
+        f"[VIZ] lightweight prepass: animating {n_preview} candidate TacTip poses before depth-camera collection",
+        flush=True,
+    )
+    for idx in range(n_preview):
+        if not simulation_app.is_running():
+            break
+        _preview_sampling_candidate(
+            sim,
+            idx,
+            contacts[idx],
+            normals[idx],
+            reference_depth,
+            object_center=object_center,
+            sphere_pos=None if sphere_positions is None else sphere_positions[idx],
+            sphere_angles=None if sphere_angles is None else sphere_angles[idx],
+            pause_seconds=max(float(args_cli.visualize_prepass_pause), 0.0),
+        )
+
+
+def _update_sampling_visualization(
+    sim: sim_utils.SimulationContext,
+    sample_idx: int,
+    contact: np.ndarray,
+    normal: np.ndarray,
+    patch_world: np.ndarray,
+    eye: np.ndarray,
+):
+    _ensure_sampling_viz_root()
+    marker_scale = max(float(args_cli.visualize_marker_scale), 1.0e-5)
+    contact = np.asarray(contact, dtype=np.float32).reshape(3)
+    normal = np.asarray(normal, dtype=np.float32).reshape(3)
+    normal /= np.linalg.norm(normal) + 1.0e-12
+    eye = np.asarray(eye, dtype=np.float32).reshape(3)
+
+    _SAMPLING_VIZ_CONTACTS.append(contact.copy())
+    if args_cli.visualize_point_markers:
+        history = np.stack(_SAMPLING_VIZ_CONTACTS, axis=0)
+        _draw_points("/World/SamplingViz/contact_history", history, (0.10, 0.35, 1.0), marker_scale * 1.4)
+        _draw_points("/World/SamplingViz/current_patch", np.asarray(patch_world, dtype=np.float32), (1.0, 0.20, 0.08), marker_scale * 0.9)
+    else:
+        _delete_if_valid("/World/SamplingViz/contact_history")
+        _delete_if_valid("/World/SamplingViz/current_patch")
+
+    if args_cli.visualize_direction_lines:
+        press_line = np.stack([contact + normal * marker_scale * 12.0, contact, contact - normal * marker_scale * 6.0], axis=0)
+        camera_line = np.stack([eye, contact], axis=0)
+        _draw_curve("/World/SamplingViz/press_direction", press_line, (0.02, 0.02, 0.02), marker_scale * 0.75)
+        _draw_curve("/World/SamplingViz/camera_to_contact", camera_line, (0.0, 0.75, 0.75), marker_scale * 0.45)
+    else:
+        _delete_if_valid("/World/SamplingViz/press_direction")
+        _delete_if_valid("/World/SamplingViz/camera_to_contact")
+    _update_active_tactip_visual(sim, contact, normal, eye)
+    _focus_viewport_on_contact(sim, contact, normal)
+
+    print(
+        "[VIZ] sample "
+        f"{sample_idx:06d}: contact=({contact[0]:+.4f}, {contact[1]:+.4f}, {contact[2]:+.4f}), "
+        f"normal=({normal[0]:+.3f}, {normal[1]:+.3f}, {normal[2]:+.3f})",
+        flush=True,
+    )
+
+    if args_cli.visualize_sampling_pause > 0.0:
+        end_time = time.perf_counter() + args_cli.visualize_sampling_pause
+        while time.perf_counter() < end_time and simulation_app.is_running():
+            sim.step()
+            _refresh_ur5_tactip_articulation(sim)
+            time.sleep(0.015)
+
+
+def _make_camera() -> TiledCamera:
+    camera_prim_path = "/World/TactileCamera"
+    offset_pos = (0.0, 0.0, 0.0)
+    offset_rot = (1.0, 0.0, 0.0, 0.0)
+    update_latest_camera_pose = False
+    if args_cli.spawn_ur5_tactip and _UR5_TACTIP_ARTICULATION is not None:
+        sensor_offset_pos, sensor_offset_quat, _ = _selected_tcp_to_sensor_offset()
+        camera_prim_path = "/World/UR5_TacTip_Workcell/tcp_link/tactile_cam"
+        offset_pos = sensor_offset_pos
+        offset_rot = sensor_offset_quat
+        update_latest_camera_pose = True
+        _delete_if_valid(camera_prim_path)
+
+    camera_cfg = TiledCameraCfg(
+        height=args_cli.tactile_img_size,
+        width=args_cli.tactile_img_size,
+        prim_path=camera_prim_path,
+        update_period=0.0,
+        update_latest_camera_pose=update_latest_camera_pose,
+        data_types=["distance_to_image_plane"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=args_cli.focal_length,
+            focus_distance=400.0,
+            horizontal_aperture=args_cli.horizontal_aperture,
+            clipping_range=(args_cli.near_plane, args_cli.far_plane),
+        ),
+        offset=TiledCameraCfg.OffsetCfg(pos=offset_pos, rot=offset_rot, convention="ros"),
+    )
+    return TiledCamera(camera_cfg)
+
+
+def _make_camera_preserving_scene(sim: sim_utils.SimulationContext) -> TiledCamera:
+    camera = _make_camera()
+    print("[VIZ] tactile depth camera created without scene reset; preserving current UR5 pose.", flush=True)
+    _pump_gui(sim, 0.0, min_steps=max(int(args_cli.render_steps), 2))
+    _restore_viewport(sim)
+    return camera
+
+
+def _frame_from_normal(normal: np.ndarray, contact: np.ndarray | None = None) -> np.ndarray:
+    normal = normal / (np.linalg.norm(normal) + 1.0e-12)
+    z_axis = -normal
+
+    def _project_tangent(vec: np.ndarray) -> np.ndarray:
+        return vec - np.dot(vec, z_axis) * z_axis
+
+    preferred_y = _project_tangent(np.array([0.0, 0.0, 1.0], dtype=np.float64))
+    if np.linalg.norm(preferred_y) < 1.0e-4:
+        preferred_y = _project_tangent(np.array([1.0, 0.0, 0.0], dtype=np.float64))
+    if np.linalg.norm(preferred_y) < 1.0e-4:
+        preferred_y = _project_tangent(np.array([0.0, 1.0, 0.0], dtype=np.float64))
+    if np.linalg.norm(preferred_y) < 1.0e-4 and contact is not None:
+        robot_anchor = np.array([0.0, 0.0, 0.25], dtype=np.float64)
+        preferred_y = _project_tangent(robot_anchor - np.asarray(contact, dtype=np.float64))
+    preferred_y /= np.linalg.norm(preferred_y) + 1.0e-12
+    x_axis = np.cross(preferred_y, z_axis)
+    x_axis /= np.linalg.norm(x_axis) + 1.0e-12
+    y_axis = np.cross(z_axis, x_axis)
+    y_axis /= np.linalg.norm(y_axis) + 1.0e-12
+    return np.column_stack([x_axis, y_axis, z_axis])
+
+
+def _read_depth(camera: TiledCamera, sim: sim_utils.SimulationContext) -> np.ndarray:
+    for _ in range(max(args_cli.render_steps, 1)):
+        sim.step()
+        _refresh_ur5_tactip_articulation(sim)
+        camera.update(sim.get_physics_dt())
+
+    depth = camera.data.output["distance_to_image_plane"][0].detach().cpu().numpy()
+    if depth.ndim == 3:
+        depth = depth[..., 0]
+    return depth.astype(np.float32)
+
+
+def _render_touch(
+    camera: TiledCamera,
+    sim: sim_utils.SimulationContext,
+    contact: np.ndarray,
+    normal: np.ndarray,
+    reference_depth: np.ndarray,
+    object_center: np.ndarray | None = None,
+    sphere_pos: np.ndarray | None = None,
+    sphere_angles: np.ndarray | None = None,
+):
+    if sphere_angles is not None:
+        rot_m = _touchsdf_sphere_frame(sphere_angles)
+        quat_wxyz = _touchsdf_sphere_quat_wxyz(sphere_angles)
+    else:
+        rot_m = _frame_from_normal(normal, contact)
+        quat_wxyz = _quat_wxyz_from_frame(rot_m)
+    eye = _estimate_touch_eye(contact, normal, reference_depth)
+    touch_tcp_pos = eye
+    if args_cli.spawn_ur5_tactip and _UR5_TACTIP_ARTICULATION is not None:
+        touch_tcp_pos, _ = _tcp_pose_from_sensor_pose(eye, quat_wxyz)
+    if args_cli.spawn_ur5_tactip and _UR5_TACTIP_ARTICULATION is not None:
+        if object_center is None or sphere_pos is None or sphere_angles is None:
+            print("[SAFE] skipped tactile render: TouchSDF sphere target was not provided.", flush=True)
+            return None, None, rot_m, eye
+        _hold_current_ur5_joint_state(sim)
+        ok, quat_wxyz = _move_ur5_touchsdf_high_and_sphere(
+            sim,
+            object_center,
+            sphere_pos,
+            sphere_angles,
+            "render",
+        )
+        if not ok:
+            return None, None, rot_m, eye
+        best_tactile = None
+        best_current_depth = None
+        best_tcp = None
+        best_sensor = None
+        best_center_deformation = -1.0
+        target_deformation = max(float(args_cli.indentation_depth) * float(args_cli.robot_touch_trigger_ratio), 0.0)
+        approach_steps = max(int(args_cli.robot_approach_steps) * 4, 12)
+        approach_alphas = np.linspace(0.0, 1.0, approach_steps, dtype=np.float32)
+        for approach_idx, alpha in enumerate(approach_alphas):
+            approach_eye = np.asarray(sphere_pos, dtype=np.float64) + float(alpha) * (
+                np.asarray(touch_tcp_pos, dtype=np.float64) - np.asarray(sphere_pos, dtype=np.float64)
+            )
+            if not _command_ur5_tcp_pose(
+                sim, approach_eye, quat_wxyz, max_iters=20, pos_tol=0.008, rot_tol_rad=0.45
+            ):
+                print("[SAFE] stopped TouchSDF inward approach early: next TCP step was unsafe.", flush=True)
+                break
+            depth = _read_depth(camera, sim)
+            tactile, current_depth, center_deformation = _tactile_from_depth(depth, reference_depth)
+            if tactile is None:
+                continue
+            best_tactile = tactile
+            best_current_depth = current_depth
+            best_tcp = approach_eye.copy()
+            best_sensor, _ = _sensor_pose_from_tcp_pose(best_tcp, quat_wxyz)
+            best_center_deformation = center_deformation
+            if center_deformation >= target_deformation:
+                break
+        if best_tactile is None:
+            return None, None, rot_m, eye
+        if args_cli.tactile_mode == "tactip_deformation":
+            print(
+                "[TOUCH] TouchSDF inward TacTip contact reached: "
+                f"deformation={best_center_deformation:.6f}m "
+                f"target>={target_deformation:.6f}m "
+                f"tcp=({best_tcp[0]:+.4f}, {best_tcp[1]:+.4f}, {best_tcp[2]:+.4f})",
+                flush=True,
+            )
+        return best_tactile, best_current_depth, rot_m, np.asarray(best_sensor, dtype=np.float32)
+    else:
+        camera.set_world_poses(
+            positions=torch.tensor(eye[None, :], device=sim.device, dtype=torch.float32),
+            orientations=torch.tensor(quat_wxyz[None, :], device=sim.device, dtype=torch.float32),
+            convention="ros",
+        )
+    depth = _read_depth(camera, sim)
+    tactile, current_depth, _ = _tactile_from_depth(depth, reference_depth)
+    if tactile is None:
+        return None, None, rot_m, eye
+    return tactile, current_depth, rot_m, eye
+
+
+def _sample_patch(dense_points: np.ndarray, tree: cKDTree, contact: np.ndarray, rot_m: np.ndarray) -> np.ndarray:
+    idxs = tree.query_ball_point(contact, args_cli.patch_radius)
+    if len(idxs) < args_cli.points_per_touch:
+        _, nearest = tree.query(contact, k=min(args_cli.points_per_touch, len(dense_points)))
+        idxs = np.asarray(nearest).reshape(-1).tolist()
+    replace = len(idxs) < args_cli.points_per_touch
+    chosen = np.random.choice(np.asarray(idxs), size=args_cli.points_per_touch, replace=replace)
+    patch_world = dense_points[chosen]
+    return ((patch_world - contact) @ rot_m).astype(np.float32)
+
+
+def _save_png(image: np.ndarray, path: Path):
+    cv2.imwrite(str(path), np.clip(image * 255.0, 0, 255).astype(np.uint8))
+
+
+def _empty_data() -> dict[str, list]:
+    return {
+        "tactile_imgs": [],
+        "pointclouds": [],
+        "rot_M_wrld_list": [],
+        "pos_wrld_list": [],
+        "pos_wrk_list": [],
+        "obj_index": [],
+        "initial_pos": [],
+        "mesh_path": [],
+        "tactile_reference_depth": [],
+        "tactile_current_depth": [],
+    }
+
+
+def _stack_data(data: dict[str, list]) -> dict[str, np.ndarray]:
+    return {
+        "tactile_imgs": np.stack(data["tactile_imgs"], axis=0).astype(np.float32),
+        "pointclouds": np.stack(data["pointclouds"], axis=0).astype(np.float32),
+        "rot_M_wrld_list": np.stack(data["rot_M_wrld_list"], axis=0).astype(np.float32),
+        "pos_wrld_list": np.stack(data["pos_wrld_list"], axis=0).astype(np.float32),
+        "pos_wrk_list": np.stack(data["pos_wrk_list"], axis=0).astype(np.float32),
+        "obj_index": np.asarray(data["obj_index"], dtype=object).reshape(-1, 1),
+        "initial_pos": np.stack(data["initial_pos"], axis=0).astype(np.float32),
+        "mesh_path": np.asarray(data["mesh_path"], dtype=object).reshape(-1, 1),
+        "tactile_reference_depth": np.stack(data["tactile_reference_depth"], axis=0).astype(np.float32),
+        "tactile_current_depth": np.stack(data["tactile_current_depth"], axis=0).astype(np.float32),
+    }
+
+
+def main():
+    np.random.seed(args_cli.seed)
+    torch.manual_seed(args_cli.seed)
+    object_initial_pos = np.array([args_cli.object_world_x, args_cli.object_world_y, args_cli.object_world_z], dtype=np.float32)
+
+    shapenet_root = Path(args_cli.shapenet_root).expanduser().resolve()
+    if not shapenet_root.exists():
+        raise FileNotFoundError(f"ShapeNet root not found: {shapenet_root}")
+
+    dataset_name, output_dir = _make_output_dir()
+    meshes = _find_meshes(shapenet_root)
+    if not meshes:
+        raise RuntimeError(f"No ShapeNet mesh files found under: {shapenet_root}")
+    reference_depth = _load_reference_depth()
+
+    stage_utils.create_new_stage()
+    sim_cfg = sim_utils.SimulationCfg(dt=1.0 / 60.0, render_interval=1, device=args_cli.device)
+    sim = sim_utils.SimulationContext(sim_cfg)
+    sim_utils.DistantLightCfg(intensity=3000.0).func("/World/Light", sim_utils.DistantLightCfg(intensity=3000.0))
+    camera = None
+    try:
+        if args_cli.spawn_ur5_tactip:
+            _spawn_ur5_tactip_visuals()
+        sim.reset()
+        if _UR5_TACTIP_ARTICULATION is not None:
+            _UR5_TACTIP_ARTICULATION.reset()
+            _initialize_ur5_tactip_controller(sim)
+            print("[VIZ] initializing UR5 with TouchSDF rest pose before sampling...", flush=True)
+            _initialize_ur5_at_object_top_standby(sim)
+
+        print(f"[INFO] dataset={dataset_name}", flush=True)
+        print(f"[INFO] meshes={len(meshes)} root={shapenet_root}", flush=True)
+        print(f"[INFO] output_dir={output_dir}", flush=True)
+        print(f"[INFO] tactile_mode={args_cli.tactile_mode} reference={_reference_depth_path()}", flush=True)
+        print(
+            f"[INFO] indentation_depth={args_cli.indentation_depth:.4f}m "
+            f"surface_clearance={args_cli.surface_clearance:.4f}m "
+            f"approach_offset={args_cli.robot_approach_offset:.4f}m "
+            f"approach_steps={args_cli.robot_approach_steps} "
+            f"joint_step={args_cli.robot_joint_step_size:.4f}rad",
+            flush=True,
+        )
+        print(
+            f"[INFO] object_world_pos=({object_initial_pos[0]:+.3f}, {object_initial_pos[1]:+.3f}, {object_initial_pos[2]:+.3f})",
+            flush=True,
+        )
+        if args_cli.object_bottom_z is not None:
+            print(
+                f"[INFO] object_bottom_z={float(args_cli.object_bottom_z):+.3f}m "
+                f"(actual lowest point = object_world_z + object_bottom_z)",
+                flush=True,
+            )
+        if args_cli.visualize_sampling:
+            print(
+                "[VIZ] Live Isaac sampling visualization is enabled. GUI startup can take 2-3 minutes; "
+                "the script will frame each object automatically once the viewport is ready.",
+                flush=True,
+            )
+        if args_cli.spawn_ur5_tactip and not args_cli.visualize_sampling:
+            _pump_gui(sim, 1.0)
+
+        data = _empty_data()
+        rows = []
+        sample_idx = 0
+
+        for object_idx, mesh_path in enumerate(meshes):
+            if sample_idx >= args_cli.total_target_charts or not simulation_app.is_running():
+                break
+            category_id, object_id = _mesh_ids(shapenet_root, mesh_path)
+            try:
+                mesh = _load_scaled_mesh(mesh_path)
+                mesh_initial_pos = _mesh_bbox_center(mesh).astype(np.float32)
+                object_label = f"{category_id}/{object_id}"
+                if args_cli.spawn_ur5_tactip and _UR5_TACTIP_ARTICULATION is not None:
+                    _delete_if_valid("/World/Object")
+                    _clear_active_object_collision_guard()
+                    print(f"[VIZ] resetting UR5 to TouchSDF rest before spawning {object_label}...", flush=True)
+                    _initialize_ur5_at_object_top_standby(sim)
+                _spawn_mesh(mesh)
+                if args_cli.spawn_ur5_tactip and _UR5_TACTIP_ARTICULATION is not None:
+                    _clear_active_object_collision_guard()
+                    print(
+                        "[SAFE] TouchSDF compatibility: robot-object collision guard is disabled for this object, "
+                        "matching pipeline_tactile.py setCollisionFilterPair(..., 0).",
+                        flush=True,
+                    )
+                    _hold_current_ur5_joint_state(sim)
+                else:
+                    _set_active_object_collision_guard(mesh, object_label)
+                if args_cli.visualize_sampling:
+                    _reset_sampling_visualization()
+                    _focus_viewport_on_mesh(sim, mesh, object_label)
+                dense_points, _ = trimesh.sample.sample_surface(mesh, args_cli.dense_surface_samples)
+                tree = cKDTree(dense_points)
+                contacts, normals, sphere_positions, sphere_angles, touchsdf_object_center = _sample_touchsdf_spherical_contacts(
+                    mesh,
+                    dense_points,
+                    args_cli.charts_per_object * max(8, int(args_cli.contact_oversample_factor)),
+                )
+                if len(contacts) == 0:
+                    print(f"[WARN] skip mesh {mesh_path}: no TouchSDF spherical contacts found.", flush=True)
+                    continue
+                bbox_center = _mesh_bbox_center(mesh)
+                print(
+                    f"[INFO] contact_policy={category_id}/{object_id}: "
+                    "touchsdf_robot_touch_spherical "
+                    f"candidates={len(contacts)} "
+                    f"{_contact_direction_stats(normals)} "
+                    f"bbox_center=({bbox_center[0]:+.3f}, {bbox_center[1]:+.3f}, {bbox_center[2]:+.3f})",
+                    flush=True,
+                )
+                if args_cli.visualize_sampling:
+                    _draw_sampling_candidates(contacts)
+                    _pump_gui(sim, args_cli.visualize_startup_pause)
+                    _play_sampling_prepass(
+                        sim,
+                        contacts,
+                        normals,
+                        reference_depth,
+                        object_center=touchsdf_object_center,
+                        sphere_positions=sphere_positions,
+                        sphere_angles=sphere_angles,
+                    )
+                    if camera is None:
+                        print("[VIZ] initializing tactile depth camera after prepass...", flush=True)
+                        camera = _make_camera_preserving_scene(sim)
+                        _focus_viewport_on_mesh(sim, mesh, f"{category_id}/{object_id}")
+                        _pump_gui(sim, 0.5)
+            except Exception as exc:
+                print(f"[WARN] skip mesh {mesh_path}: {exc}", flush=True)
+                continue
+
+            if camera is None:
+                camera = _make_camera_preserving_scene(sim)
+
+            valid_for_object = 0
+            for contact, normal, sphere_pos, angles in zip(contacts, normals, sphere_positions, sphere_angles):
+                if valid_for_object >= args_cli.charts_per_object or sample_idx >= args_cli.total_target_charts:
+                    break
+                if np.linalg.norm(normal) < 1.0e-8:
+                    continue
+
+                if args_cli.spawn_ur5_tactip and _UR5_TACTIP_ARTICULATION is not None:
+                    _hold_current_ur5_joint_state(sim)
+                if args_cli.visualize_sampling and args_cli.visualize_each_candidate:
+                    _preview_sampling_candidate(
+                        sim,
+                        candidate_idx,
+                        contact,
+                        normal,
+                        reference_depth,
+                        object_center=touchsdf_object_center,
+                        sphere_pos=sphere_pos,
+                        sphere_angles=angles,
+                    )
+                elif args_cli.visualize_sampling and args_cli.spawn_ur5_tactip:
+                    _pump_gui(sim, 0.0, min_steps=1)
+                tactile, current_depth, rot_m, eye = _render_touch(
+                    camera,
+                    sim,
+                    contact,
+                    normal,
+                    reference_depth,
+                    object_center=touchsdf_object_center,
+                    sphere_pos=sphere_pos,
+                    sphere_angles=angles,
+                )
+                if tactile is None:
+                    if args_cli.spawn_ur5_tactip and _UR5_TACTIP_ARTICULATION is not None:
+                        _hold_current_ur5_joint_state(sim)
+                    continue
+                patch = _sample_patch(dense_points, tree, contact, rot_m)
+                if args_cli.visualize_sampling:
+                    _update_sampling_visualization(sim, sample_idx, contact, normal, patch @ rot_m.T + contact, eye)
+                if args_cli.spawn_ur5_tactip and _UR5_TACTIP_ARTICULATION is not None:
+                    _hold_current_ur5_joint_state(sim)
+
+                tactile_chw = tactile[None, :, :]
+                obj_index = f"{category_id}/{object_id}"
+                data["tactile_imgs"].append(tactile_chw)
+                data["pointclouds"].append(patch)
+                data["rot_M_wrld_list"].append(rot_m)
+                data["pos_wrld_list"].append(contact.astype(np.float32))
+                data["pos_wrk_list"].append(np.zeros(3, dtype=np.float32))
+                data["obj_index"].append(obj_index)
+                data["initial_pos"].append(mesh_initial_pos.copy())
+                data["mesh_path"].append(str(mesh_path))
+                data["tactile_reference_depth"].append(reference_depth)
+                data["tactile_current_depth"].append(current_depth)
+
+                image_file = ""
+                if args_cli.save_png:
+                    image_file = f"images/sample_{sample_idx:06d}_{category_id}_{object_id}.png"
+                    _save_png(tactile, output_dir / image_file)
+
+                sample_dict = {
+                    key: np.asarray(value[-1:])
+                    if key not in ("obj_index", "mesh_path")
+                    else np.asarray(value[-1:], dtype=object).reshape(1, 1)
+                    for key, value in data.items()
+                }
+                if args_cli.save_per_sample_npy:
+                    np.save(output_dir / f"{sample_idx}.npy", sample_dict)
+
+                rows.append(
+                    {
+                        "sample_id": sample_idx,
+                        "object_index": object_idx,
+                        "category_id": category_id,
+                        "object_id": object_id,
+                        "mesh_path": str(mesh_path),
+                        "image_file": image_file,
+                        "tactile_mean": float(tactile.mean()),
+                        "object_center_x": float(mesh_initial_pos[0]),
+                        "object_center_y": float(mesh_initial_pos[1]),
+                        "object_center_z": float(mesh_initial_pos[2]),
+                        "camera_x": float(eye[0]),
+                        "camera_y": float(eye[1]),
+                        "camera_z": float(eye[2]),
+                    }
+                )
+                sample_idx += 1
+                valid_for_object += 1
+
+            print(
+                f"[INFO] object {object_idx + 1}/{len(meshes)} {category_id}/{object_id}: +{valid_for_object}, total={sample_idx}",
+                flush=True,
+            )
+
+        if sample_idx == 0:
+            raise RuntimeError("No valid touch charts were collected.")
+
+        stacked = _stack_data(data)
+        pkl_path = output_dir.parent / f"{dataset_name}.pkl"
+        npy_path = output_dir.parent / f"{dataset_name}.npy"
+        with open(pkl_path, "wb") as f:
+            pickle.dump(stacked, f)
+        np.save(npy_path, stacked)
+
+        with open(output_dir / "manifest.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+        metadata = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "dataset_name": dataset_name,
+            "label_source": "mesh_surface_patch_in_tcp_frame",
+            "tactile_source": "tactip_reference_depth_difference",
+            "tactile_mode": args_cli.tactile_mode,
+            "sensor_type": args_cli.sensor_type,
+            "reference_depth_path": str(_reference_depth_path()),
+            "indentation_depth": args_cli.indentation_depth,
+            "surface_clearance": args_cli.surface_clearance,
+            "robot_approach_offset": args_cli.robot_approach_offset,
+            "robot_approach_steps": args_cli.robot_approach_steps,
+            "robot_joint_step_size": args_cli.robot_joint_step_size,
+            "robot_touch_trigger_ratio": args_cli.robot_touch_trigger_ratio,
+            "robot_object_collision_guard": False if args_cli.spawn_ur5_tactip else not args_cli.disable_robot_object_collision_guard,
+            "robot_object_clearance": args_cli.robot_object_clearance,
+            "robot_body_clearance": args_cli.robot_body_clearance,
+            "robot_transit_height": args_cli.robot_transit_height,
+            "robot_lateral_clearance": args_cli.robot_lateral_clearance,
+            "robot_ellipsoid_clearance": args_cli.robot_ellipsoid_clearance,
+            "robot_planner_skip_direct": args_cli.robot_planner_skip_direct,
+            "robot_motion_policy": "touchsdf_robot_touch_spherical",
+            "touchsdf_high_offset_wrld": _TOUCHSDF_HIGH_OFFSET_WRLD,
+            "touchsdf_default_tcp_rpy_wrld": list(_TOUCHSDF_DEFAULT_TCP_RPY_WRLD),
+            "robot_home_preset": _selected_robot_joint_preset_name(),
+            "robot_initial_joint_positions": _selected_robot_joint_positions(),
+            "max_deformation_depth": args_cli.max_deformation_depth,
+            "deformation_scale": args_cli.deformation_scale,
+            "shapenet_root": str(shapenet_root),
+            "output_dir": str(output_dir),
+            "pkl_path": str(pkl_path),
+            "npy_path": str(npy_path),
+            "samples": sample_idx,
+            "points_per_touch": args_cli.points_per_touch,
+            "tactile_img_size": args_cli.tactile_img_size,
+            "scale": args_cli.scale,
+            "object_world_pos": object_initial_pos.tolist(),
+            "object_bottom_z": args_cli.object_bottom_z,
+            "patch_radius": args_cli.patch_radius,
+            "contact_sampling_strategy": args_cli.contact_sampling_strategy,
+            "contact_azimuth_bins": args_cli.contact_azimuth_bins,
+            "contact_elevation_bins": args_cli.contact_elevation_bins,
+            "contact_min_elevation_deg": args_cli.contact_min_elevation_deg,
+            "contact_max_elevation_deg": args_cli.contact_max_elevation_deg,
+            "contact_oversample_factor": args_cli.contact_oversample_factor,
+            "camera_distance": args_cli.camera_distance,
+            "depth_span": args_cli.depth_span,
+            "ur5_tactip_visual_asset": _UR5_TACTIP_VISUAL_ASSET,
+            "active_tactip_visual_asset": "",
+        }
+        with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"[DONE] TouchSDF dataset: {pkl_path}", flush=True)
+        print(f"[DONE] NPY dataset: {npy_path}", flush=True)
+        print(f"[DONE] Manifest: {output_dir / 'manifest.csv'}", flush=True)
+    finally:
+        if camera is not None:
+            del camera
+        try:
+            import omni.replicator.core as rep
+
+            rep.vp_manager.destroy_hydra_textures("Replicator")
+        except Exception:
+            pass
+        sim._timeline.stop()
+        sim.clear_all_callbacks()
+        sim.clear_instance()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        simulation_app.close()

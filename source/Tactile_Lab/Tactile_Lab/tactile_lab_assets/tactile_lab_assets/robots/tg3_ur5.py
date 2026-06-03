@@ -1,0 +1,80 @@
+import isaaclab.sim as sim_utils
+from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.assets.articulation import ArticulationCfg
+# from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
+from importlib import resources
+from pathlib import Path
+import os
+
+def make_ur5_tactip_cfg(usd_path: str, activate_contact_sensors: bool = False) -> ArticulationCfg:
+    return ArticulationCfg(
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=usd_path,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=True,
+                max_depenetration_velocity=5.0,
+            ),
+            activate_contact_sensors=activate_contact_sensors,
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=False,
+                solver_position_iteration_count=16,
+                solver_velocity_iteration_count=1,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.001, rest_offset=-0.0005),
+        ),
+        init_state=ArticulationCfg.InitialStateCfg(
+            joint_pos={
+                "base_joint": 0.2051,
+                "shoulder_joint": -1.9185,
+                "elbow_joint": -2.0555,
+                "wrist_1_joint": -0.78493,
+                "wrist_2_joint": 1.5708,
+                "wrist_3_joint": 0.0,
+            }
+        ),
+        actuators={
+            "shoulder": ImplicitActuatorCfg(
+                joint_names_expr=["base_joint", "shoulder_joint"],
+                effort_limit_sim=87.0,
+                stiffness=200.0,
+                damping=40.0,
+            ),
+            "elbow": ImplicitActuatorCfg(
+                joint_names_expr=["elbow_joint"],
+                effort_limit_sim=87.0,
+                stiffness=200.0,
+                damping=40.0,
+            ),
+            "wrist": ImplicitActuatorCfg(
+                joint_names_expr=["wrist_.*"],
+                effort_limit_sim=87.0,
+                stiffness=200.0,
+                damping=40.0,
+            ),
+        },
+    )
+
+
+
+def get_tactile_lab_assets_root() -> Path:
+    for p in Path(__file__).resolve().parents:
+        candidate = p.parent / "Tactile_Lab_External_Assets"
+        if candidate.exists():
+            return candidate
+    raise RuntimeError("Could not locate Tactile_Lab_External_Assets")
+ASSET_ROOT = get_tactile_lab_assets_root()
+print(' [Tactile_Lab] Tactile Lab Assets root path: ', ASSET_ROOT)
+
+UR5_TACTIP_CFG = make_ur5_tactip_cfg(
+    os.path.join(ASSET_ROOT, "Robots/tg3_asset/ur5_standard_tactip_edge.usd")
+)
+
+UR5_RA_TACTIP_CFG = make_ur5_tactip_cfg(
+    os.path.join(ASSET_ROOT, "Robots/tg3_asset/right_angle_tactip.usd"),
+    activate_contact_sensors=True
+)
+
+BITOUCH_UR5_RA_TACTIP_CFG = make_ur5_tactip_cfg(
+    os.path.join(ASSET_ROOT, "Robots/tg3_asset/ur5_with_right_angle_tactip.usd"),
+    activate_contact_sensors=True
+)
